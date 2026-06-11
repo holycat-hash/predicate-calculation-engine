@@ -1,5 +1,7 @@
 # PredicateCalculationEngine（PCE）
 
+**语言：** [English](README.md) | 中文
+
 一个纯数据驱动的谓词计算引擎（Rust 实现），面向游戏逻辑等高频帧驱动场景。
 整个系统有且只有四层抽象——**runtime / entity / calculation / predicate**——任何新需求必须折叠进这四层，禁止引入第五种概念：没有消息、没有事件总线、没有回调、没有全局函数。
 

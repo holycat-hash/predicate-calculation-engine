@@ -1,5 +1,7 @@
 # Method Collection for Tricky Logic
 
+**Language:** English | [中文](../docs-zh/README.md)
+
 This directory collects implementation patterns for tricky logic that can be expressed using only **predicate + calculation + entity decomposition**.
 The rule is the same as Section 0 of [PCE.md](PCE.md): the four layers are closed, every requirement must fold into them, and no fifth concept is introduced.
 

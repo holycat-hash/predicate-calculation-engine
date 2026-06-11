@@ -1,5 +1,7 @@
 # 16 Same-Frame XP and Loot Allocation
 
+**Language:** English | [中文](../docs-zh/16-xp-loot-split.md)
+
 ## Problem
 
 "A monster dies: 100 XP must be integer-split among three members without loss or duplication. A rare drop opens a roll window; the highest roll wins, late rolls are invalid. Common loot uses a round-robin cursor; three same-frame drops must advance the cursor by three. The whole flow must be auditable."

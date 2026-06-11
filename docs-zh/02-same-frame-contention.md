@@ -1,5 +1,7 @@
 # 02 同帧多方抢唯一资源
 
+**语言：** [English](../docs/02-same-frame-contention.md) | 中文
+
 ## 问题
 
 「N 个 Unit 同帧申请拾取同一个 Item，恰好一个成功，其余各方都要知道结果。」

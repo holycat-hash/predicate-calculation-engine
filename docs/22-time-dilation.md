@@ -1,5 +1,7 @@
 # 22 Hitstop / Bullet Time / Local Time Dilation
 
+**Language:** English | [中文](../docs-zh/22-time-dilation.md)
+
 ## Problem
 
 "Hitstop freezes attacker and victim for several frames. Bullet time makes enemies act at half speed while the player stays full speed. Frozen entities stop for N frames. Their combo windows, invulnerability, cooldowns, and poison leases should all extend naturally and resume from the same point. Different entities may run at different rates, and rates can change."

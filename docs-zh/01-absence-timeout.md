@@ -1,5 +1,7 @@
 # 01 超时 / 静默 N 帧 / 心跳掉线
 
+**语言：** [English](../docs/01-absence-timeout.md) | 中文
+
 ## 问题
 
 「Session 若 30 帧内没有收到 Heartbeat，判定掉线。」

@@ -1,5 +1,7 @@
 # 13 Aggro and Taunt Table
 
+**Language:** English | [中文](../docs-zh/13-aggro-taunt.md)
+
 ## Problem
 
 "Each enemy maintains an aggro table toward players. Damage adds 1 hate per point. Healing adds 0.5 times the heal amount to all enemies fighting the healed target. Taunt forces top priority for 120 frames. Hate decays 5% per second. Target switching requires the challenger to exceed the current target by 110%. Dead or disengaged targets are cleared and a new target is selected."

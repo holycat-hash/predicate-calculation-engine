@@ -1,5 +1,7 @@
 # 07 全局排序 / Top-K 排行榜
 
+**语言：** [English](../docs/07-global-order-topk.md) | 中文
+
 ## 问题
 
 「实时维护全服 Top-10 分数榜，UI 在榜单变化时刷新。」

@@ -1,5 +1,7 @@
 # 17 Same-Frame Movement and Knockback Composition
 
+**Language:** English | [中文](../docs-zh/17-knockback-compose.md)
+
 ## Problem
 
 "In one frame, two explosions, a dash, a slow field, and platform movement all affect a unit. Root prevents active movement but forced movement still applies. Super armor resists knockback. If two hooks grab the same target in one frame, exactly one wins and losers receive receipts. The final movement must not clip through walls."

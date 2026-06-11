@@ -1,5 +1,7 @@
 # 05 Cooldowns and State Machines
 
+**Language:** English | [中文](../docs-zh/05-cooldown-state-machine.md)
+
 ## Problem
 
 "A skill has a 60-frame cooldown; cast requests during cooldown must be rejected. A character state machine has `idle/casting/stunned`, and illegal transitions such as casting while stunned must not happen."

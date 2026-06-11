@@ -1,5 +1,7 @@
 # 04 Dynamic Subscription Targets and Spatial Neighborhoods
 
+**Language:** English | [中文](../docs-zh/04-dynamic-subscription.md)
+
 ## Problem
 
 "A melee unit only cares about occupancy changes in the grid cell it currently stands in. Units move between cells."

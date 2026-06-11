@@ -1,5 +1,7 @@
 # 07 Global Ordering / Top-K Leaderboard
 
+**Language:** English | [中文](../docs-zh/07-global-order-topk.md)
+
 ## Problem
 
 "Maintain a real-time server-wide Top-10 score board, and refresh UI when it changes."

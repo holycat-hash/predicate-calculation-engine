@@ -1,5 +1,7 @@
 # 19 Atomic Consume and Double-Spend
 
+**Language:** English | [中文](../docs-zh/19-atomic-consume.md)
+
 ## Problem
 
 "One key and two doors request consumption in the same frame: only one door opens. A shop purchase deducts coins from the player and stock from the shop; any failure or mid-flight disappearance must not lose or duplicate money or goods."

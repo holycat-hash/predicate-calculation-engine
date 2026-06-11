@@ -1,5 +1,7 @@
 # 11 Immunity and Invincibility
 
+**Language:** English | [中文](../docs-zh/11-immunity-invincibility.md)
+
 ## Problem
 
 "After being hit, a unit is invincible for 30 frames. Super armor ignores knockback but still takes damage. Poison immunity is permanent. A boss is immune while a crystal is alive. Blocked attacks must display an 'Immune!' floating text."

@@ -1,5 +1,7 @@
 # 18 Casting, Channeling, and Interrupts
 
+**Language:** English | [中文](../docs-zh/18-cast-interrupt.md)
+
 ## Problem
 
 "A fireball casts for 90 frames and settles on completion. Taking 50 cumulative damage or being stunned interrupts immediately, movement cancels, the last 10 frames are uninterruptible, and interrupt refunds 70% mana. A channel ticks every 30 frames and keeps already-settled ticks when interrupted."

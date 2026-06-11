@@ -1,5 +1,7 @@
 # 21 Linked Life and Damage Transfer
 
+**Language:** English | [中文](../docs-zh/21-linked-life.md)
+
 ## Problem
 
 "A bodyguard skill makes B take 50% of A's damage. If A and B guard each other, does damage bounce forever? Can transferred damage be transferred again? Total damage must be exactly conserved. If the bodyguard dies while damage is in flight, where does that half go?"

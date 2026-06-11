@@ -1,5 +1,7 @@
 # PredicateCalculationEngine (PCE)
 
+**Language:** English | [中文](README-zh.md)
+
 A pure data-driven predicate calculation engine implemented in Rust, aimed at high-frequency frame-driven domains such as game logic.
 The system has exactly four abstraction layers: **runtime / entity / calculation / predicate**. Every new requirement must be folded into these four layers. There is no fifth concept: no messages, no event bus, no callbacks, and no global functions.
 

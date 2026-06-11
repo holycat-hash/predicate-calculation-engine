@@ -1,5 +1,7 @@
 # 10 Damage Formula: Bilateral Pipeline, Shields, and Reflection
 
+**Language:** English | [中文](../docs-zh/10-damage-pipeline.md)
+
 ## Problem
 
 "Final damage = attack * multiplier * crit * (1 - armor reduction) * (1 + vulnerability - mitigation). Deduct shields before HP, true damage pierces shields, targets reflect 10%, many same-frame sources net correctly, and shield overflow is exact."

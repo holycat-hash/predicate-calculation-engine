@@ -1,5 +1,7 @@
 # 12 Limited Charges: Deathrattle, Ward Stacks, Nth Trigger
 
+**Language:** English | [中文](../docs-zh/12-limited-charges.md)
+
 ## Problem
 
 "A deathrattle fires exactly once. A charm blocks three lethal hits and fails on the fourth. Every fifth attack is empowered. If five hits land in one frame while one charm charge remains, exactly one hit is blocked, not five and not zero."

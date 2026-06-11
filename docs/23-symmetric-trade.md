@@ -1,5 +1,7 @@
 # 23 Two-Player Trade / Symmetric Atomic Exchange
 
+**Language:** English | [中文](../docs-zh/23-symmetric-trade.md)
+
 ## Problem
 
 "Two players trade face to face. Each offers items and confirms. When both confirm, the exchange commits atomically. If either side changes the offer before the other confirms, stale confirmation must be invalid. Cancellation or disconnect must refund both sides exactly. Items must not duplicate or disappear."

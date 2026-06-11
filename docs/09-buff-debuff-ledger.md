@@ -1,5 +1,7 @@
 # 09 Buff/Debuff: Stacks, Refresh, Dispel, and Panels
 
+**Language:** English | [中文](../docs-zh/09-buff-debuff-ledger.md)
+
 ## Problem
 
 "A +20% attack buff lasts 300 frames. Reapplying the same kind refreshes duration and stacks up to a cap. Different kinds multiply. One dispel removes all magic debuffs. Panel attack is `(base + sum(additive)) * product(multipliers)`, and every add/remove must be reflected immediately."

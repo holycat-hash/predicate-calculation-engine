@@ -1,5 +1,7 @@
 # 20 Projectiles: Flight, Pierce, and Hit Dedupe
 
+**Language:** English | [中文](../docs-zh/20-projectile.md)
+
 ## Problem
 
 "An arrow flies every frame and stops on hit. A piercing arrow can hit at most three targets and never the same target twice. Fast arrows must not tunnel through cells. Wind can deflect projectiles, shields can reflect them and transfer attribution, and arrows keep flying after the shooter dies."

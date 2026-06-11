@@ -1,5 +1,7 @@
 # 14 Combo Windows / Cancel Frames / Input Buffering
 
+**Language:** English | [中文](../docs-zh/14-combo-cancel-buffer.md)
+
 ## Problem
 
 "Frames 12-20 of an action are cancel frames. If a buffered combo input exists inside the window, cancel immediately into the next action. Input may arrive before the window and must not be lost. Input during the window should be consumed as soon as possible. One input is consumed exactly once. Later input overwrites earlier input. Buffers expire."

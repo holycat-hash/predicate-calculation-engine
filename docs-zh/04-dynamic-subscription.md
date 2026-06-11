@@ -1,5 +1,7 @@
 # 04 动态订阅目标与空间邻域
 
+**语言：** [English](../docs/04-dynamic-subscription.md) | 中文
+
 ## 问题
 
 「近战 Unit 只关心自己所在格子的占用变化；Unit 会移动换格。」

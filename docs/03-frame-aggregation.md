@@ -1,5 +1,7 @@
 # 03 In-Frame Aggregation: Many Attackers, Many Sources
 
+**Language:** English | [中文](../docs-zh/03-frame-aggregation.md)
+
 ## Problem
 
 "In the same frame, five attackers hit one unit and two healers heal it. The final HP must be correct."

@@ -1,5 +1,7 @@
 # 02 Same-Frame Contention for a Unique Resource
 
+**Language:** English | [中文](../docs-zh/02-same-frame-contention.md)
+
 ## Problem
 
 "N units request to pick up the same item in the same frame. Exactly one succeeds, and every requester must learn the result."

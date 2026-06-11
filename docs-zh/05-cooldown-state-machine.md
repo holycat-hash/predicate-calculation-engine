@@ -1,5 +1,7 @@
 # 05 冷却与状态机
 
+**语言：** [English](../docs/05-cooldown-state-machine.md) | 中文
+
 ## 问题
 
 「技能冷却 60 帧；施法请求在冷却中要被拒绝。角色状态机 idle/casting/stunned，

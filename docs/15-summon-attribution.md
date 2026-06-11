@@ -1,5 +1,7 @@
 # 15 Summon Ownership and Kill Attribution
 
+**Language:** English | [中文](../docs-zh/15-summon-attribution.md)
+
 ## Problem
 
 "A player summons a pet, the pet creates a totem, and kills by any descendant credit the root owner. The killer gets XP, top contributor gets title progress, contributors above 10% get assists. Pets can be tamed and transferred. The owner may leave and leave orphan pets. A fireball may hit after ownership changed: who gets credit?"

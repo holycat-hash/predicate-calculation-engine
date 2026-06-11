@@ -1,5 +1,7 @@
 # 01 Timeout / N Silent Frames / Heartbeat Drop
 
+**Language:** English | [中文](../docs-zh/01-absence-timeout.md)
+
 ## Problem
 
 "If a `Session` has not received a `Heartbeat` for 30 frames, mark it disconnected."

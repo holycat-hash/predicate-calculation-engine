@@ -1,5 +1,7 @@
 # 08 Chain Reactions: Explosion Chains, Contagion, Dominoes
 
+**Language:** English | [中文](../docs-zh/08-chain-reaction.md)
+
 ## Problem
 
 "A barrel explodes, damages nearby barrels, and those barrels explode in turn until the chain burns out."

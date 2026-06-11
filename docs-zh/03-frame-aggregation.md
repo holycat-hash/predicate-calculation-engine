@@ -1,5 +1,7 @@
 # 03 帧内聚合：多攻击者合伤、多来源合流
 
+**语言：** [English](../docs/03-frame-aggregation.md) | 中文
+
 ## 问题
 
 「同一帧 5 个 Attacker 打同一个 Unit，外加 2 个 Healer 治疗，结算后的 hp 要正确。」

@@ -1,84 +1,88 @@
-# PredicateCalculationEngine（PCE）
+# PredicateCalculationEngine (PCE)
 
-一个纯数据驱动的谓词计算引擎（Rust 实现），面向游戏逻辑等高频帧驱动场景。
-整个系统有且只有四层抽象——**runtime / entity / calculation / predicate**——任何新需求必须折叠进这四层，禁止引入第五种概念：没有消息、没有事件总线、没有回调、没有全局函数。
+A pure data-driven predicate calculation engine implemented in Rust, aimed at high-frequency frame-driven domains such as game logic.
+The system has exactly four abstraction layers: **runtime / entity / calculation / predicate**. Every new requirement must be folded into these four layers. There is no fifth concept: no messages, no event bus, no callbacks, and no global functions.
 
-唯一的触发源是「上一帧的写入」。轮询、消息、事件全部被统一为「对某个 cell（实体实例的一个字段）的 write」。
+The only trigger source is "writes from the previous frame." Polling, messages, and events are all unified as writes to a cell, where a **cell** is one field of one entity instance.
 
-## 核心设计
+## Core Design
 
-| 层 | 职责 |
+| Layer | Responsibility |
 |---|---|
-| **runtime** | 唯一的调度者与索引持有者：双缓冲、写集路由、谓词索引、fold 增量状态、实例生命周期 |
-| **entity** | 实例化的最小单位（`entityname.id`）；全局状态以 singleton entity 表达（如 `Clock.0`）|
-| **calculation** | 图灵完备的业务代码；输入是前置 predicate 的交付（值快照），输出只能写**自己实例**的字段 |
-| **predicate** | 注册期定型的声明式三段结构 `(scope, condition, delivery)`，封闭代数、可编译、可索引 |
+| **runtime** | The only scheduler and index owner: double buffering, write-set routing, predicate indexes, incremental fold state, and instance lifecycle |
+| **entity** | The smallest instantiated unit (`entityname.id`); global state is represented as singleton entities such as `Clock.0` |
+| **calculation** | Turing-complete business code; input is the delivery from the preceding predicate as value snapshots, and output may only write fields on its own instance |
+| **predicate** | A declaration-shaped triple `(scope, condition, delivery)` fixed at registration time; closed algebra, compilable, and indexable |
 
-三条钉死的决议：
+Three pinned decisions:
 
-- **D1 单写者制** —— 每个字段静态归属唯一一个 calculation，注册期检查，冲突即错。
-- **D2 写即事件** —— write 一律产生事件，无论值是否变化；「值真的变了」由条件 `changed` 显式表达。
-- **D3 batch 不排序** —— batch 交付顺序未定义，消费逻辑必须顺序无关（多重集语义）。
+- **D1 Single writer**: every field statically belongs to exactly one calculation. Conflicts are rejected at registration.
+- **D2 Writes are events**: every write produces an event, even if the value does not change. Real value changes are expressed explicitly with `changed`.
+- **D3 Batches are unordered**: batch delivery order is undefined. Consumers must be order-independent and treat input as a multiset.
 
-由此白送的性质：快照读（本帧写入本帧不可见）、执行阶段无数据竞争可并行、反馈环天然展开为帧间 ping-pong，以及**成本不变量**——整帧调度成本 O(|W|·log + |F|)，与谓词总数、实例总数、数据总量无关。
+These constraints buy snapshot reads, parallel execution without data races, feedback loops that naturally unfold as frame-to-frame ping-pong, and the **cost invariant**: total per-frame scheduling cost is `O(|W|*log + |F|)`, independent of the total number of predicates, instances, or cells.
 
-## 示例
+## Example
 
-文档 §7 的谓词 DSL 风格：
+Predicate DSL style from document Section 7:
 
-```
-# 血量跌穿 30% —— 边沿触发，不会每帧重复
+```text
+# HP crosses below 30%: edge-triggered, not repeated every frame
 on    own(hp)
-where crossed(0.3 * own.hp_max, ↓)
+where crossed(0.3 * own.hp_max, down)
 each  deliver(new, old)
-→ flee_calc                          # 写 own(state)
+-> flee_calc                         # writes own(state)
 
-# 攻击 —— 跨实体交互的唯一通道：写自己，被对方嗅探
+# Attack: the only cross-entity interaction path is writing yourself
+# and letting the target sniff that write.
 on    type(Attacker, attack_out)
 where new.target = self
 each  deliver(new.dmg)
-→ take_damage_calc                   # 受击方写 own(hp)
+-> take_damage_calc                  # target writes own(hp)
 ```
 
-对应的 Rust API 用法见 [src/main.rs](src/main.rs)（`pce-demo` 可执行示例）。
+See [src/main.rs](src/main.rs) for the corresponding Rust API usage in the `pce-demo` executable.
 
-## 快速开始
+## Quick Start
 
 ```powershell
-cargo run            # 运行 demo（§7 示例 1 + 2：攻击数据流 + 血量边沿触发）
-cargo test           # 运行 tests/ 下的场景用例
+cargo run            # Run the demo (Section 7 examples 1 + 2)
+cargo test           # Run the scenario tests under tests/
 ```
 
-## 仓库结构
+## Repository Layout
 
-```
+```text
 src/
-  lib.rs             # crate 入口与核心导出
-  entity.rs          # 实体类型 / 实例 / 字段 / cell 地址
-  predicate.rs       # 谓词代数：scope / condition / delivery
-  calculation.rs     # calculation 注册与执行上下文
-  value.rs           # cell 值类型
-  runtime/           # 调度器：双缓冲、写集路由、时钟
+  lib.rs             # Crate entry point and core exports
+  entity.rs          # Entity types, instances, fields, and cell addresses
+  predicate.rs       # Predicate algebra: scope / condition / delivery
+  calculation.rs     # Calculation registration and execution context
+  value.rs           # Cell value type
+  runtime/           # Scheduler: double buffers, write routing, clock
 docs/
-  PCE文档.md          # 架构总纲（四层抽象、帧模型、成本模型、不变量清单）
-  README.md          # 「刁钻逻辑切分方法集」索引（23 篇场景文档）
-  01..23-*.md        # 各场景：超时、同帧争用、连锁反应、原子消耗、双人交易……
-tests/               # 由场景文档转化的可运行用例
+  PCE.md             # Architecture guide
+  README.md          # Scenario-method index
+  01..23-*.md        # Scenario documents
+docs-zh/
+  ...                # Chinese documentation
+tests/               # Executable Rust integration tests derived from the scenario docs
 ```
 
-## 文档
+## Documentation
 
-- 架构总纲：[docs/PCE文档.md](docs/PCE文档.md) —— 四层抽象、帧模型与数据流、predicate 规范、成本模型与索引绑定、注册期编译、不变量清单与开放问题。
-- 场景方法集：[docs/README.md](docs/README.md) —— 23 篇「只靠 predicate + calculation + entity 切分」落地刁钻逻辑的文档（仇恨嘲讽、连击取消、投射物、时间膨胀、对称交易等），每篇含正确性论证与成本分析，并附通用手法速查。
+- Architecture guide: [docs/PCE.md](docs/PCE.md). Covers the four layers, frame model, predicate specification, cost model and index binding, registration-time compilation, invariants, and open questions.
+- Scenario method collection: [docs/README.md](docs/README.md). Covers 23 tricky logic patterns implemented using only predicate + calculation + entity decomposition, including aggro/taunt, combo cancel, projectiles, time dilation, and symmetric trades.
+- Chinese documentation is kept under [docs-zh/](docs-zh/) with the Chinese root README at [README-zh.md](README-zh.md).
 
-## 测试覆盖
+## Test Coverage
 
-`docs/01..23-*.md` 的 23 篇场景文档均已转成 `tests/` 下的 Rust 集成测试。每个测试文件对应一篇场景文档，验证文档里的关键切分、不变量与 D1/D2/D3 约束。
+The 23 scenario documents under `docs/01..23-*.md` have corresponding Rust integration tests under `tests/`. Each test file validates the key decomposition, invariants, and D1/D2/D3 constraints from its scenario.
 
 ```powershell
 cargo test
 ```
 
-## 状态
+## Status
 
-早期原型（0.1.0，无第三方依赖）。runtime 仍是脚手架阶段，部分索引优化与谓词编译收敛还在 `TODO` 中；但 23 篇场景文档已经全部有可运行集成测试，可作为当前行为与设计约束的回归网。
+Early prototype (`0.1.0`, no third-party dependencies). The runtime is still scaffold-level and some index optimization / predicate compilation convergence is still marked as `TODO`, but all 23 scenario documents already have executable integration tests that serve as the current behavior and design regression net.

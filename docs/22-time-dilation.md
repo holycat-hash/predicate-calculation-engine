@@ -1,102 +1,58 @@
-# 22 顿帧 / 子弹时间 / 局部时间膨胀
+# 22 Hitstop / Bullet Time / Local Time Dilation
 
-## 问题
+## Problem
 
-「命中顿帧让攻守双方冻结若干帧；子弹时间让敌人以 1/2 速行动而玩家全速；冰冻
-完全时停 N 帧。被冻结者的连击窗口、无敌帧、冷却、中毒租约必须随之顺延，解冻
-后从断点继续；不同实体可以同时处于不同速率，速率还会中途再变。」
+"Hitstop freezes attacker and victim for several frames. Bullet time makes enemies act at half speed while the player stays full speed. Frozen entities stop for N frames. Their combo windows, invulnerability, cooldowns, and poison leases should all extend naturally and resume from the same point. Different entities may run at different rates, and rates can change."
 
-## 为什么刁钻
+## Why It Is Tricky
 
-- **全系统的时长语义都建立在 `Clock.frame` 之差上**：手法 4 的时间戳守卫
-  （`cd_ready_at`、`lease_until`、`invuln_until`、[14](14-combo-cancel-buffer.md)
-  的缓冲期限）盖的都是全局帧绝对戳。一旦实体各有进速，「全局帧差」≠「体感
-  时长」，这些守卫**集体失真**：顿帧 6 帧会白吃掉冷却 6 帧、无敌帧凭空流逝。
-- **修补式方案「冻结时给所有未到期的戳 +N」不可行**：戳散落在各 calc 私有字段
-  里，D1 下没有任何人有权代改；即便破例，枚举挂起戳是 O(戳数) 且注定漏掉
-  尚未写出的未来戳。
-- **缩放不是平移**：慢放 1/2 下「30 帧冷却」要 60 全局帧，速率中途再变则连
-  换算系数都不是常量——绝对全局戳根本无法预先算出到期帧。
-- **跨实体交互两轴并存**：攻击者全速、受击者冻结，命中与无敌的判定该用谁的轴？
-- 浮点累加 `local += scale` 在 10^5 帧量级会漂移穿帧，破坏回放确定性。
+Many time semantics are written as differences on `Clock.frame`. Once each entity has its own rate, global-frame difference no longer equals perceived duration. Patching all future timestamps by adding N is impossible under D1 and misses timestamps not yet written. Slowdown is scaling, not translation. Cross-entity checks must choose whose time axis owns the rule. Floating-point accumulation drifts and breaks replay.
 
-## 切分
+## Decomposition
 
-核心手法：**本地时间轴字段化 + 时间戳守卫换轴 + 冻结即停轴**。
+Use **local time axis as a field + timestamp guards on that axis + freeze as stopped axis**.
 
-- 每实体一个 **timekeeper** 单写者（订阅 `Clock.frame`——动画/物理本就每帧
-  推进，已付轮询，[14](14-combo-cancel-buffer.md) 同款判据），推进 own
-  `local_time` 单调整数。速率 = num/den **整数分数累加**（Bresenham）：
-  `acc += num; local += acc div den; acc %= den`，acc < den 恒成立，零漂移。
-- **冻结 = 停轴**：`freeze_left > 0` 时不推进，每帧 O(1)，不触碰任何挂起戳
-  ——「所有窗口/冷却/租约自动顺延」不是被维护出来的，是停轴的**推论**，
-  天然覆盖尚未写出的未来戳。
-- **一切相对时长换轴**：盖戳与判定都用**同一实体**的 local_time。
-  `cd_ready_at = own.local_time + 30`；守卫 `cmp(own.local_time, ≥,
-  own.cd_ready_at)`——手法 4 的形完全不变，只换轴，零触发拒绝照旧免费。
-- **跨实体事件用被判定者的轴**：无敌帧是受击者的规则，守卫读 own.local_time
-  与 own.invuln_until——两个都是 own 字段。架构恰好不允许引用别人的行
-  （§3.3），反而把正确选择变成唯一能写出来的写法。
-- pace / hitstop 请求是外部异步写：timekeeper 每帧醒着，自己的请求 cell 直接
-  快照读，无需额外订阅；用单调 seq 吸收重复采样与同帧竞争；顿帧刷新取 max。
+- Every entity has a single-writer **timekeeper** subscribing to `Clock.frame`. Animation/physics already pays this polling cost.
+- Advance `local_time` as an integer fraction accumulator: `acc += num; local_time += acc / den; acc %= den`.
+- Freeze means do not advance the axis while `freeze_left > 0`. No pending timestamps are modified.
+- Every relative duration stamps and compares on the same entity's local axis.
+- Cross-entity judgments use the judged entity's axis. Invulnerability belongs to the defender, so the predicate compares defender `own.local_time` and `own.invuln_until`.
 
-## 谓词代数
+## Predicate Algebra
 
-```
-# 1 时间轴：已付轮询的单写者；速率与冻结同一次运行原子吸收
+```text
 on    type(Clock, frame)
 each
-→ timekeeper_calc   # seq 新则采纳 pace / freeze（顿帧取 max）；
-                    # freeze_left > 0 → 停轴；否则 acc += num,
-                    # local_time += acc div den, acc %= den
+-> timekeeper_calc
 
-# 2 冷却：时间戳守卫换轴，冷却中的请求零触发
 on    own(cast_req)
-where cmp(own.local_time, ≥, own.cd_ready_at)
+where cmp(own.local_time, >=, own.cd_ready_at)
 batch deliver(new)
-→ skill_calc        # cast_count += 1；cd_ready_at = own.local_time + 30
+-> skill_calc
 
-# 3 无敌帧：跨实体命中，用被判定者的轴
 on    type(Attacker, attack_out)
-where new.target = self and cmp(own.local_time, ≥, own.invuln_until)
+where new.target = self and cmp(own.local_time, >=, own.invuln_until)
 batch deliver(new.dmg)
-→ take_damage_calc
+-> take_damage_calc
 ```
 
-## 正确性论证
+## Correctness Argument
 
-- **单调性保留**：local_time 单调不减 ⇒ 所有 `≥` / `crossed` 守卫语义与全局轴
-  完全同构；换轴是同态替换，不需要逐守卫重新论证。
-- **顺延免维护**：冻结期内任何以本地轴为基准的窗口、冷却、租约自动顺延——
-  没有「枚举修戳」这一步，因此不存在漏修；解冻即从断点继续（轴值未动）。
-- **历史保真**：速率变更只影响未来推进——轴是速率的积分，改速率改的是导数，
-  已盖出去的戳全部保持有效，不需要追改（D1 下也无人有权追改）。
-- **确定性**：整数分数累加无漂移；pace/stop 用 seq 单调吸收（同帧多请求与
-  快照重复读双重免疫，D3 合规）；timekeeper 是 local_time 唯一写者（D1），
-  所有读者经快照在同帧读到一致的轴值。
-- **i 帧判定取受击者轴**：攻击者轴上「打中了」与受击者轴上「无敌中」并存时，
-  判定语义属于规则的所有者（受击者）——与 [11](11-immunity-invincibility.md)
-  的互补守卫同款分工；本篇测试演示全局帧差早已超过无敌时长、本地轴未到
-  ⇒ 仍然格挡。
-- **终止/活性**：停轴有界（freeze_left 单调减到 0），不存在永久冻结的隐式
-  状态；速率为 0/1 即显式时停，解除走同一 seq 通道。
+- `local_time` is monotone, so `>=` and edge guards keep the same shape as global-time guards.
+- Freeze extension is a consequence of the axis not moving. There is no timestamp enumeration and no missed field.
+- Rate changes affect future integration only; already-stamped deadlines remain valid.
+- Integer fraction accumulation is deterministic and drift-free.
+- Same-frame pace/freeze requests use monotone seqs to absorb duplicate sampling and D3 competition.
+- I-frame checks use the victim's axis because that rule is owned by the victim. The architecture makes this the only predicate-expressible option.
 
-## 成本
+## Cost
 
-每实体每帧 O(1)，由动画/物理推进已付（手法：已付轮询折叠）。完全静止的实体
-可退化为 alarm 驱动的稀疏推进（到期补帧差），代价回到它本来的事件数。守卫
-零触发不变；整帧成本 O(活动实体数)，与谓词总数无关（成本不变量）。
+One O(1) timekeeper run per active entity per frame, usually already paid by animation/physics. Completely idle entities can switch to sparse alarm-driven advancement. Guard rejection remains zero-trigger.
 
-## 涟漪
+## Ripple Effects
 
-[01](01-absence-timeout.md) 的租约、[05](05-cooldown-state-machine.md) 的冷却、
-[11](11-immunity-invincibility.md) 的无敌帧、[14](14-combo-cancel-buffer.md)
-的连击窗口与缓冲期限——在有时间伸缩的游戏里都应换到本地轴；14 的 buffer_len
-若留在全局轴，顿帧会吃掉输入缓冲（同样的失真，同样的解）。
+The lease from [01](01-absence-timeout.md), cooldown from [05](05-cooldown-state-machine.md), invulnerability from [11](11-immunity-invincibility.md), and combo windows and buffers from [14](14-combo-cancel-buffer.md) should all use local time in games with time scaling.
 
-## 可运行验证
+## Runnable Verification
 
-`tests/time_dilation.rs` 三个用例：顿帧 20 帧期间冷却停摆（全局帧差超过 CD
-仍被零触发拒绝，解冻走满本地轴后放行，全程无人改 cd_ready_at）；半速下本地轴
-整数分数推进恰好减半、复速不重写历史；受击者冻结时无敌窗随轴停摆——全局轴上
-早该过期的 i 帧仍然格挡，解冻走到本地到期点后同样的攻击命中。
+`tests/time_dilation.rs` verifies hitstop pausing cooldowns, exact half-speed integer advancement, and defender-axis invulnerability during freeze.

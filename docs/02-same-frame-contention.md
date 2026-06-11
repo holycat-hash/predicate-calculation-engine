@@ -1,54 +1,47 @@
-# 02 同帧多方抢唯一资源
+# 02 Same-Frame Contention for a Unique Resource
 
-## 问题
+## Problem
 
-「N 个 Unit 同帧申请拾取同一个 Item，恰好一个成功，其余各方都要知道结果。」
+"N units request to pick up the same item in the same frame. Exactly one succeeds, and every requester must learn the result."
 
-## 为什么刁钻
+## Why It Is Tricky
 
-- 写局部性：没人能直接写 `Item.owner` 之外实例的字段，胜负无法「通知」。
-- D3：申请以 batch 到达且**顺序未定义**，「先到先得」不可表达——裁决必须是
-  申请多重集上的顺序无关函数。
-- id 无顺序语义（§1.2），不能拿 id 当决胜键。
+- Write locality: nobody except the item's own calculation can write `Item.owner`, so the winner cannot be "notified" by directly writing requesters.
+- D3: applications arrive in a batch with undefined order. "First come first served" is not expressible; arbitration must be an order-independent function of the request multiset.
+- Entity ids carry no ordering semantics and cannot be used as tie-breakers.
 
-## 切分
+## Decomposition
 
-- **entity** `Unit`：字段 `claim`（ref+优先级的结构）、`want`（ref，指向想抢的 Item，
-  作为回执通道的订阅锚点）。
-- **entity** `Item`：字段 `owner`（ref）。Item 自己就是仲裁者——资源即裁判，
-  不需要第三方实体。
-- **calculation** `claim_calc`(挂 Unit)：写 `own(claim) = {item: ref, prio: p, salt: s}`
-  同时写 `own(want) = item_ref`。
-- **calculation** `grant_calc`(挂 Item)：收整帧申请，裁决，写 `own(owner)`。
-- **calculation** `on_result_calc`(挂 Unit)：经 inst-ref 盯 `owner` 收回执。
+- **entity** `Unit`: field `claim` containing item ref plus priority, and `want` as a ref to the desired `Item`. `want` is the receipt anchor.
+- **entity** `Item`: field `owner`. The item itself is the arbitrator; no third-party entity is needed.
+- **calculation** `claim_calc` on `Unit`: writes `own(claim) = {item, prio, salt}` and `own(want) = item_ref`.
+- **calculation** `grant_calc` on `Item`: receives frame-batched claims, arbitrates, writes `own(owner)`.
+- **calculation** `on_result_calc` on `Unit`: watches the item owner through `inst`.
 
-## 谓词代数
+## Predicate Algebra
 
-```
-# 仲裁：batch 收一帧内全部申请
+```text
+# Arbitration: receive all same-frame claims in one batch.
 on    type(Unit, claim)
-where new.item = self and not cmp(own.owner, ≠, null)   # 已有主则不再裁
+where new.item = self and not cmp(own.owner, !=, null)
 batch deliver(writer_id, new.prio, new.salt)
-→ grant_calc      # winner = max by (prio, salt)；写 own(owner) = winner_ref
+-> grant_calc      # winner = max by (prio, salt); write own(owner) = winner_ref
 
-# 回执：申请方经自己持有的 ref 盯结果（inst scope 是「别人行」的唯一合法读法）
+# Receipt: requester watches the result through its own ref.
 on    inst(want, owner)
 each  deliver(new)
-→ on_result_calc  # new = self → 成功；否则失败，清 own(want)、另寻目标
+-> on_result_calc  # new = self means success; otherwise fail and clear own(want)
 ```
 
-## 正确性论证
+## Correctness Argument
 
-- 顺序无关：`max by (prio, salt)` 是多重集函数，与交付顺序无关（D3 合规）。
-  决胜键 `salt` 是业务字段（随机盐或入场序），不依赖 id 顺序。
-- 平局：(prio, salt) 仍并列时裁决不确定——这是规格问题不是机制问题；
-  要求确定性回放就保证决胜键全序。
-- D1：`owner` 唯一归 grant_calc；申请方永远写不到它。
-- 时序：帧 N 申请 → 帧 N+1 裁决写 owner → 帧 N+2 各申请方收回执。
-  两帧延迟是数据流交互的固有代价（§7 示例 2 同款）。
-- 守卫 `owner = null`：占用后的迟到申请不再触发仲裁；失败方经回执自行放弃。
+- `max by (prio, salt)` is a multiset function and therefore independent of delivery order.
+- `salt` is a business field, such as random salt or entry order. It must not be entity id order.
+- If `(prio, salt)` still ties, the result is unspecified. Deterministic replay requires a total tie-break key.
+- D1: only `grant_calc` writes `owner`; requesters can never write it.
+- Timeline: frame N request -> frame N+1 item writes owner -> frame N+2 requesters receive the receipt. The two-frame delay is the natural cost of dataflow interaction.
+- The `owner = null` guard prevents late requests from re-arbitrating an already owned item.
 
-## 成本
+## Cost
 
-申请路由：`new.item = self` 等值条件 → 值桶 O(1)+命中数（§4）。
-batch append O(1)/条；裁决 O(当帧申请数)；回执 inst 订阅 O(1)+触发数。
+`new.item = self` is an equality condition and can use a value bucket: `O(1) + hits`. Batch append is `O(1)` per claim; arbitration is `O(number of claims in the frame)`. Receipt delivery through `inst` is `O(1) + triggers`.

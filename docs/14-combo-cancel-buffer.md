@@ -1,118 +1,53 @@
-# 14 连击窗口 / 取消帧 / 输入缓冲
+# 14 Combo Windows / Cancel Frames / Input Buffering
 
-## 问题
+## Problem
 
-「动作的第 12–20 帧是取消窗口：窗口内若有缓存的连击输入，立即取消当前动作
-接出下一段。输入可以先于窗口到达（提前搓好），不能丢，要等窗口开启的那一帧
-消费；窗口内按下则尽快消费；同一次输入恰好消费一次；后按的键覆盖先按的；
-缓冲有期限，太早的输入不得在十几帧后突然弹出来。」
+"Frames 12-20 of an action are cancel frames. If a buffered combo input exists inside the window, cancel immediately into the next action. Input may arrive before the window and must not be lost. Input during the window should be consumed as soon as possible. One input is consumed exactly once. Later input overwrites earlier input. Buffers expire."
 
-## 为什么刁钻
+## Why It Is Tricky
 
-- **「第 12–20 帧」是相对区间**：谓词条件只能引用 new / old / own 字段与常量
-  （§3.3），而「动作的第 12 帧」不是任何 cell 的值，是 action_frame 与动作数据
-  的关系。→ 窗口端点字段化：`cancel_from / cancel_to` 写成 own 字段，比较成为
-  合法的活阈值（§4 诚实退化条款，代价仍与全局规模无关）。
-- **输入先于窗口**：输入写入的那一帧窗口条件为假，谓词没有记忆，错过即丢；
-  但也不能提前消费（早收）。「等到窗口开启再用」要求把瞬时事件变成日后可查询的
-  水位 → 意图寄存为 cell。
-- **两条对偶边沿**：意图先到，等 action_frame 跨进窗口（对 action_frame 的边沿）；
-  窗口开着，等意图到达（对 intent 的边沿）。单谓词制（§1.4）下两条异形边沿喂
-  同一个消费者，标准出路是双谓词归一化（手法 7）——但代价见下面的对照。
-- **恰好一次**：窗口开着的每一帧「af ∈ [from, to] ∧ intent ≠ null」都为真——
-  这是**电平不是边沿**；而 D2 写即事件 + action_frame 每帧都写，意味着谓词层的
-  「在窗内」每帧都命中。
-- **动作重启**：消费成功 = 当前动作换成新动作：action_frame 归零、窗口端点换表、
-  连击数 +1。归零让「old < from ∧ new ≥ from」这类边沿条件语义碎裂（连段直接
-  落进下一段窗内时边沿不存在）；推进者与消费者若是两个 calc，归零还违反 D1
-  ——必须再修一条请求数据流。
+- "Frames 12-20" is a relative interval, not a cell value. Make endpoints fields such as `cancel_from` and `cancel_to`.
+- Input may arrive before the window. A predicate that was false at input time has no memory, so the instant event must become a later-queryable waterline.
+- There are two dual edges: intent first then window opens, or window open then intent arrives.
+- "Inside the window and intent present" is a level condition, not an edge. With D2, a driver writing `action_frame` every frame would trigger every frame.
+- Action restart resets the frame and changes all window fields atomically; splitting those writes across calculations breaks D1 and edge semantics.
 
-## 切分
+## Decomposition
 
-核心手法：**窗口端点字段化 + 意图寄存（单调 seq）+ 驱动器已付轮询统一双边沿**。
+Use **window endpoints as fields + intent register with monotone seq + paid driver polling**.
 
-关键观察：格斗角色的动作推进**本来就是每帧逻辑**——动画帧必须前进，这个 calc
-必然订阅 `Clock.frame`（§6.2 唯一合法的轮询出口），这份每帧成本是**已付的**。
-既然每帧都有一个单写者醒来推进 action_frame，把窗口判定、意图消费、动作重启
-折叠进同一次运行就是免费的：
+Fighting-game actions already advance every frame, so `action_drive_calc` must subscribe to `Clock.frame`. That cost is already paid. Fold window checks, intent consumption, action restart, and expiry into the same run.
 
-- 两条边沿统一为「每个动作帧采样一次意图」——开窗边沿与窗内意图边沿都退化为
-  同一行判定 `af ∈ [from, to]`；
-- 恰好一次 = 一行不等式 `intent.seq > consumed_seq`（手法 9 的 calc 内形式：
-  own 流的边沿检测搬进唯一写者，电平变状态比对）；
-- 重启原子：推进、判窗、换动作、计数、退役 seq 在一个写集里提交（§2 写折叠），
-  不存在「窗口换了而 action_frame 没归零」的可观测中间帧。
+- **entity** `Fighter`: `input_req` is written by input systems; `intent` belongs to `intent_register_calc`; `action_id`, `action_frame`, `cancel_from`, `cancel_to`, `duration`, `combo_count`, and `consumed_seq` belong to `action_drive_calc`.
+- Intent registration collapses local/network/AI input and same-frame multiple buttons into a monotone seq; D3 uses `max(seq)`.
 
-- **entity** `Fighter`：`input_req`（外部输入层写，writer 侧盖帧戳，手法 4）；
-  `intent` 归 **intent_register**；`action_id / action_frame / cancel_from /
-  cancel_to / duration / combo_count / consumed_seq` 七字段同归 **action_drive**
-  （一 calc 持多字段，05/10/19 先例——这些量之间的转移必须在一次运行内原子）。
-- 意图寄存保留为归一化级：多源输入（本地 / 网络回放 / AI）、同帧多键、搓招序列
-  识别都在这里塌缩成单调 seq 的意图；D3 下批内取 max(seq)，不依赖到达序。
-  缓冲期限 = `now − intent.frame > buffer_len`，到期由驱动器把 seq 退役——
-  作废与消费走同一通道。
+## Predicate Algebra
 
-## 谓词代数
-
-```
-# 1 意图寄存：异源输入塌缩为单调 seq 的水位 cell
+```text
 on    own(input_req)
 batch deliver(new)
-→ intent_register_calc   # 批内取 max(seq)（D3：到达序不可用）；寄存值只升不降
+-> intent_register_calc    # keep max(seq)
 
-# 2 动作驱动器：已付的每帧轮询；推进、判窗、消费、重启同一次运行原子提交
 on    type(Clock, frame)
 each  deliver(new)
-→ action_drive_calc      # af += 1；af > duration → idle（常开窗）；
-                         # intent.seq > consumed_seq ∧ 未过期 ∧ af ∈ [from, to]
-                         #   → 换动作：af = 0、换窗口表、combo += 1、退役 seq
+-> action_drive_calc       # advance frame; if seq is new, not expired, and frame in window,
+                            # restart action and retire seq atomically
 ```
 
-## 与谓词边沿版的对照
+## Correctness Argument
 
-历史方案：开窗边沿谓词（`old < from ∧ new ≥ from ∧ intent ≠ null`）与窗内意图
-边沿谓词（`new ≠ null ∧ af ∈ 窗`）各自归一化出 ready 字段（手法 7），合流进
-combo_accept，再经 consume_ack 反馈环清掉 intent——5 个 calc、3 个中间字段。
+- Intent is a waterline, not a one-shot event, so it is still visible when the window opens.
+- It is not consumed early because the driver checks `action_frame in [cancel_from, cancel_to]`.
+- It is not repeated because `consumed_seq` is monotone and each seq can pass once.
+- Same-frame multiple inputs use `max(seq)`, an order-independent multiset function.
+- Expiry is checked before window acceptance, so stale inputs cannot pop later.
+- Restart is consistent because the driver is the only writer of the whole action-state cluster.
+- New input in the same frame as consumption cannot be accidentally eaten because snapshot reads make it visible only next frame.
 
-| | 谓词边沿版 | 驱动器采样版 |
-|---|---|---|
-| calc / 中间字段 | 5 / 3（ready×2、ack） | 2 / 0 |
-| 输入 → 出招延迟 | 3 帧 | 2 帧（单源免寄存级则 1 帧） |
-| 恰好一次论证 | 三处边沿守卫 + ack 环两帧赛跑窗逐帧排查 | 一行 `seq > consumed_seq`，单写者局部论证 |
-| 动作重启 | 边沿语义碎裂，需补谓词与请求流 | 原子，免费 |
-| 额外触发成本 | 0（纯边沿） | 0——轮询已由动画推进支付 |
+## Cost
 
-谓词边沿版不是错的：它是为**没有已付轮询**的实体准备的——实体不需要每帧动画时，
-正确形态是 alarm 在 `start + cancel_from` 到点唤醒（§6.2）+ 窗内意图边沿。
-判据：实体本就订阅 Clock → 折叠进驱动器；否则才值得搭谓词边沿机关。
+The action driver runs once per active fighter per frame, a cost already paid by animation/physics. Intent registration runs only on input frames. With local time dilation, window and buffer deadlines should use the entity's local time axis from [22](22-time-dilation.md).
 
-## 正确性论证
+## Runnable Verification
 
-- **不丢**：intent 是水位不是事件，驱动器每帧采样；窗口开启那一帧必然看到先到的
-  意图（快照读：意图最迟在开窗前一帧提交即可见）。
-- **不早收**：`af ∈ [from, to]` 是当帧判定，窗口外采样只读不动。
-- **不重复**：consumed_seq 单调，同一 seq 至多通过一次；ack 反馈环整条删除——
-  陈旧意图无需清除，由 seq 作废（陈旧交付消费端失效，[18](18-cast-interrupt.md)
-  同款）。
-- **同帧多键确定**：max(seq) 是多重集的确定函数（D3 合规）；覆盖语义 = 寄存值
-  只升不降。
-- **过期不弹出**：期限判定先于窗口判定，退役与消费走同一个 seq 通道，不存在
-  「过期输入复活」。
-- **重启一致**：驱动器是全部动作状态的唯一写者（D1），换段的七个字段一次提交；
-  连段直接落进新窗（af 从 0 数起）不依赖任何边沿。
-- **快照读一致**：驱动器帧 N 读到的 intent 是帧 N−1 提交值；消费与新输入同帧
-  发生时，新输入最早帧 N 寄存、帧 N+1 可见——后按的键不会被本帧消费误吞。
-
-## 成本
-
-每实体每帧恰一次驱动器运行 O(1)——由动画推进已付；intent_register 仅在有输入
-的帧运行。整帧 O(活动角色数)，与谓词总数、实例总数无关（成本不变量）。
-注意：若实体有本地时间轴（[22](22-time-dilation.md)），窗口与缓冲期限都应换轴
-——顿帧不该吃掉取消窗口与输入缓冲。
-
-## 可运行验证
-
-`tests/combo_cancel_buffer.rs` 五个用例：缓存输入恰在开窗那一帧消费（早一帧
-不行）且动作重启原子；窗内输入两帧内消费、整窗及收招后绝不重复消费；窗外输入
-等到收招回 idle 再消费（期限内不丢）；过期输入退役不复活、不污染后续；同帧
-双键两种写入次序结局同为 max(seq)（D3）。
+`tests/combo_cancel_buffer.rs` verifies buffered consumption at the opening frame, no repeat across the window, delayed but unexpired input, expired-input retirement, and same-frame dual-key determinism by `max(seq)`.

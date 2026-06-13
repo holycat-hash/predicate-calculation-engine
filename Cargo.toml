@@ -1,14 +1,21 @@
+# PCE：作为依赖使用的纯库 crate（不发布；名称为占位）。
+# 原始 API 形态保留在 docs-zh/original-api-shape.rs，仅作教学说明，
+# 不作为 src 模块导出，不参与库编译。
+# 引用方式（路径依赖示例）：
+#   [dependencies]
+#   pce = { path = "../predicate-calculation-engine" }
+# 可选 feature：
+#   parallel —— 执行阶段按触发并行（rayon）。D1 + 写局部性保证无竞争，
+#                架构白送的合法性；写折叠按触发序归并，不引入额外不确定性。
+
 [package]
 name = "pce"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
-[lib]
-name = "pce"
-path = "src/lib.rs"
-
-[[bin]]
-name = "pce-demo"
-path = "src/main.rs"
+[features]
+parallel = ["dep:rayon"]
 
 [dependencies]
+rayon = { version = "1", optional = true }

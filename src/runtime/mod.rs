@@ -228,6 +228,10 @@ pub struct Runtime {
     determinism: Determinism,
     clock: clock::Clock,
     frame: u64,
+    /// render 摄入开关：开启后每帧留存路由写集供 render 消费（默认关，零额外成本）。
+    render_feed: bool,
+    /// 本帧路由的写集（= §0 唯一触发源），render 经此摄入，与 sim 谓词所见同一流。
+    last_routed: Vec<WriteRec>,
 }
 
 impl Runtime {
@@ -248,6 +252,8 @@ impl Runtime {
             determinism: Determinism::default(),
             clock: clock::Clock::placeholder(),
             frame: 0,
+            render_feed: false,
+            last_routed: vec![],
         };
         let ty = rt.register_entity_type(
             "Clock",
@@ -281,6 +287,19 @@ impl Runtime {
     /// 免费 profiler（D2 送的遥测）：每 cell 写频、每 calc 触发数、|W|/|F|。
     pub fn profile(&self) -> &Profile {
         &self.profile
+    }
+
+    /// 开启 render 摄入：此后每次 [`Runtime::step`] 留存本帧路由写集，供第二个
+    /// （动态帧率）runtime 经 [`Runtime::committed_writes`] 消费（见 [`crate::render`]）。
+    /// 默认关闭——不开则零额外成本。
+    pub fn enable_render_feed(&mut self) {
+        self.render_feed = true;
+    }
+
+    /// 本帧路由的写集（= §0 唯一触发源）。render 的摄入源：与 sim 谓词所见同一流，
+    /// 故 render 是写流的又一消费者，含外部 spawn 的出生写。须先 [`enable_render_feed`]。
+    pub fn committed_writes(&self) -> &[WriteRec] {
+        &self.last_routed
     }
 
     // ---- 注册期 ----
@@ -324,6 +343,12 @@ impl Runtime {
     /// 已注册 entity 类型数（含内建 Clock）。
     pub fn type_count(&self) -> usize {
         self.store.types.len()
+    }
+
+    /// 某类型全体字段的默认值（含 0 号 `_alive`）。render 侧据此为出生实例的 tracked
+    /// 字段做 birth-snap（render 只见写日志增量，未写出的字段须从 schema 默认值取值）。
+    pub fn field_defaults(&self, ty: EntityTypeId) -> Vec<Value> {
+        self.store.fields(ty).iter().map(|f| f.default.clone()).collect()
     }
 
     /// 检视用：某类型当前全体存活实例。
@@ -492,6 +517,11 @@ impl Runtime {
         self.profile.last_writes = w.len();
         for rec in &w {
             *self.profile.write_counts.entry((rec.inst.ty, rec.field)).or_default() += 1;
+        }
+        // render 摄入：把本帧路由的写集（= 唯一触发源）留存给第二个 runtime 消费。
+        // 仅在开启时付这一次 O(|W|) 克隆（W 稀疏，设计公理）。
+        if self.render_feed {
+            self.last_routed = w.clone();
         }
         // 阶段一：路由（索引查找 → 条件判定 → 交付物化）
         let mut triggers = route::route(

@@ -67,11 +67,16 @@
 pub mod calculation;
 pub mod entity;
 pub mod predicate;
+pub mod render;
 pub mod runtime;
 pub mod value;
 
 pub use calculation::{CalcId, Ctx, Input};
 pub use entity::{CellAddr, EntityTypeId, FieldDef, FieldId, InstanceId};
 pub use predicate::{CmpOp, Cond, Delivery, Dir, Expr, FoldOp, Predicate, Proj, Scope, ValRef};
+pub use render::{
+    Interp, Publisher, RFieldId, RenderClock, RenderCtx, RenderInput, RenderRuntime, RenderStore,
+    SimFrame,
+};
 pub use runtime::{CalcOptions, Detect, Determinism, Profile, Residency, RowPolicy, Runtime, Tier};
 pub use value::Value;

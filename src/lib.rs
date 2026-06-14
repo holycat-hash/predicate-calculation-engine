@@ -69,6 +69,7 @@ pub mod entity;
 pub mod predicate;
 pub mod render;
 pub mod runtime;
+pub mod spatial;
 pub mod value;
 
 pub use calculation::{CalcId, Ctx, Input};
@@ -78,5 +79,9 @@ pub use render::{
     Interp, Publisher, RFieldId, RenderClock, RenderCtx, RenderInput, RenderRuntime, RenderStore,
     SimFrame,
 };
-pub use runtime::{CalcOptions, Detect, Determinism, Profile, Residency, RowPolicy, Runtime, Tier};
+pub use runtime::{
+    CalcOptions, Detect, Determinism, Profile, Residency, RowPolicy, Runtime, Schedule,
+    ScheduleGroup, Snapshot, Tier,
+};
+pub use spatial::SpatialGrid;
 pub use value::Value;

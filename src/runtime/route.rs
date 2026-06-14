@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::calculation::{CalcId, Input};
-use crate::entity::{EntityTypeId, InstanceId};
+use crate::entity::{EntityTypeId, FIELD_ALIVE, FieldId, InstanceId};
 use crate::predicate::{CmpOp, Cond, Delivery, Dir, Expr, FoldOp, Proj, ValRef};
 use crate::value::Value;
 
@@ -29,10 +29,38 @@ use super::{Determinism, Indexes, RegisteredCalc, Store, Trigger, WriteRec};
 /// sum/count 可逆（±delta，O(1)/写）；min/max 非可逆，用多重集
 /// （BTreeMap<全序位键, 计数>）维护，O(log n)/写——成员值回升时正确收缩。
 /// 「堆 vs 懒重算」按写读比自适应属 B 层，遥测入口见 [`super::Profile`]。
+///
+/// min/max 的 `contrib`（成员实例 → 其当前贡献位键）使撤销**精确**：
+/// - 写更新时撤销该 writer 的上一笔（而非靠 `w.old`——首写 old=schema 默认值，
+///   会伪命中坐在同值的他人）；
+/// - 成员死亡时（无写、§6.3）由 [`fold_revoke_member`] 按实例精确撤销其贡献，
+///   令 min/max 在成员退出后正确收缩（补 §8 开放问题三 / route.rs 旧 TODO）。
+type FoldCell = (InstanceId, FieldId);
+
 #[derive(Debug, Clone)]
 pub(crate) enum FoldAcc {
-    Num(f64),
-    Set(BTreeMap<u64, u32>),
+    Sum {
+        acc: f64,
+        contrib: HashMap<FoldCell, f64>,
+    },
+    Count {
+        count: i64,
+        contrib: HashSet<FoldCell>,
+    },
+    Set {
+        counts: BTreeMap<u64, u32>,
+        contrib: HashMap<FoldCell, u64>,
+    },
+}
+
+/// 多重集计数 -1，归零则删键。
+fn ms_dec(counts: &mut BTreeMap<u64, u32>, k: u64) {
+    if let Some(c) = counts.get_mut(&k) {
+        *c -= 1;
+        if *c == 0 {
+            counts.remove(&k);
+        }
+    }
 }
 
 /// f64 → 可全序比较的位键（单调映射，NaN 排两端）。
@@ -48,49 +76,118 @@ fn k2f(k: u64) -> f64 {
 
 pub(crate) fn fold_init(op: FoldOp) -> FoldAcc {
     match op {
-        FoldOp::Sum | FoldOp::Count => FoldAcc::Num(0.0),
-        FoldOp::Min | FoldOp::Max => FoldAcc::Set(BTreeMap::new()),
+        FoldOp::Sum => FoldAcc::Sum {
+            acc: 0.0,
+            contrib: HashMap::new(),
+        },
+        FoldOp::Count => FoldAcc::Count {
+            count: 0,
+            contrib: HashSet::new(),
+        },
+        FoldOp::Min | FoldOp::Max => FoldAcc::Set {
+            counts: BTreeMap::new(),
+            contrib: HashMap::new(),
+        },
     }
 }
 
 fn apply_fold(op: FoldOp, st: &mut FoldAcc, w: &WriteRec) {
     let new = w.new.as_f64();
-    let old = w.old.as_f64();
+    let key = (w.inst, w.field);
     match (op, st) {
-        // ±delta：O(1)/写（§4）
-        (FoldOp::Sum, FoldAcc::Num(acc)) => {
-            *acc += new.unwrap_or(0.0) - old.unwrap_or(0.0)
-        }
-        (FoldOp::Count, FoldAcc::Num(acc)) => *acc += 1.0,
-        (FoldOp::Min | FoldOp::Max, FoldAcc::Set(ms)) => {
-            // 撤销该 cell 的上一笔贡献（old 即上一帧提交值），再记入新值。
-            // 成员死亡退出的撤销属 §8 开放问题三 / B 层（懒重算时机）。
-            if let Some(o) = old {
-                if let Some(c) = ms.get_mut(&f2k(o)) {
-                    *c -= 1;
-                    if *c == 0 {
-                        ms.remove(&f2k(o));
-                    }
-                }
+        (FoldOp::Sum, FoldAcc::Sum { acc, contrib }) => {
+            if let Some(old) = contrib.remove(&key) {
+                *acc -= old;
             }
             if let Some(n) = new {
-                *ms.entry(f2k(n)).or_insert(0) += 1;
+                contrib.insert(key, n);
+                *acc += n;
+            }
+        }
+        (FoldOp::Count, FoldAcc::Count { count, contrib }) => {
+            if contrib.insert(key) {
+                *count += 1;
+            }
+        }
+        (FoldOp::Min | FoldOp::Max, FoldAcc::Set { counts, contrib }) => {
+            // 按 writer 实例精确撤销其上一笔贡献（不靠 w.old，见 FoldAcc 文档）。
+            if let Some(&oldk) = contrib.get(&key) {
+                ms_dec(counts, oldk);
+            }
+            match new {
+                Some(n) => {
+                    let k = f2k(n);
+                    contrib.insert(key, k);
+                    *counts.entry(k).or_insert(0) += 1;
+                }
+                // new 非数值（如收尸 null）：该成员停止贡献。
+                None => {
+                    contrib.remove(&key);
+                }
             }
         }
         _ => unreachable!("fold 状态与算子不匹配"),
     }
 }
 
+/// 成员死亡退出时按实例精确撤销其 min/max 贡献（§6.3 死亡无写，由 settle 调用）。
+/// 返回是否真的撤销了一笔（→ 该 fold 须标脏重投递新聚合值）。
+pub(crate) fn fold_revoke_member(st: &mut FoldAcc, member: InstanceId) -> bool {
+    match st {
+        FoldAcc::Sum { acc, contrib } => {
+            let keys: Vec<_> = contrib
+                .keys()
+                .copied()
+                .filter(|(inst, _)| *inst == member)
+                .collect();
+            for key in &keys {
+                if let Some(v) = contrib.remove(key) {
+                    *acc -= v;
+                }
+            }
+            !keys.is_empty()
+        }
+        FoldAcc::Count { count, contrib } => {
+            let keys: Vec<_> = contrib
+                .iter()
+                .copied()
+                .filter(|(inst, _)| *inst == member)
+                .collect();
+            for key in &keys {
+                if contrib.remove(key) {
+                    *count -= 1;
+                }
+            }
+            !keys.is_empty()
+        }
+        FoldAcc::Set { counts, contrib } => {
+            let keys: Vec<_> = contrib
+                .keys()
+                .copied()
+                .filter(|(inst, _)| *inst == member)
+                .collect();
+            for key in &keys {
+                if let Some(k) = contrib.remove(key) {
+                    ms_dec(counts, k);
+                }
+            }
+            !keys.is_empty()
+        }
+    }
+}
+
 fn fold_value(op: FoldOp, st: &FoldAcc) -> Value {
     match (op, st) {
-        (FoldOp::Count, FoldAcc::Num(acc)) => Value::Int(*acc as i64),
-        (FoldOp::Sum, FoldAcc::Num(acc)) => Value::Float(*acc),
-        (FoldOp::Min, FoldAcc::Set(ms)) => {
-            ms.keys().next().map_or(Value::Null, |&k| Value::Float(k2f(k)))
-        }
-        (FoldOp::Max, FoldAcc::Set(ms)) => {
-            ms.keys().next_back().map_or(Value::Null, |&k| Value::Float(k2f(k)))
-        }
+        (FoldOp::Count, FoldAcc::Count { count, .. }) => Value::Int(*count),
+        (FoldOp::Sum, FoldAcc::Sum { acc, .. }) => Value::Float(*acc),
+        (FoldOp::Min, FoldAcc::Set { counts, .. }) => counts
+            .keys()
+            .next()
+            .map_or(Value::Null, |&k| Value::Float(k2f(k))),
+        (FoldOp::Max, FoldAcc::Set { counts, .. }) => counts
+            .keys()
+            .next_back()
+            .map_or(Value::Null, |&k| Value::Float(k2f(k))),
         _ => unreachable!(),
     }
 }
@@ -127,13 +224,32 @@ fn probe_key(v: &Value) -> Option<VKey> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ThEntry {
-    t: f64,
+/// 阈值条目的非键载荷（与排序键 `t` 在 [`ThTable`] 里 SoA 并列存放）。
+#[derive(Debug, Clone, Copy)]
+struct ThMeta {
     /// 边界取等（Le/Ge）。
     eq_ok: bool,
     calc: CalcId,
     group: u32,
+}
+
+/// 共享排序阈值表（SoA）：排序键 `t` 单独连续存放——二分与命中段线性扫描
+/// 只触碰稠密 `f64` 数组（白送优化「路由 SIMD」的向量扫描数据前提），
+/// 非键载荷 `meta` 与之同序并列、按下标 lockstep 取用。
+#[derive(Debug, Clone, Default)]
+struct ThTable {
+    /// 升序排序键（二分 / 范围查询只扫这条连续 f64 列）。
+    t: Vec<f64>,
+    /// 与 `t` 同下标的载荷（eq_ok / calc / group）。
+    meta: Vec<ThMeta>,
+}
+
+impl ThTable {
+    fn insert(&mut self, t: f64, eq_ok: bool, calc: CalcId, group: u32) {
+        let i = self.t.partition_point(|&x| x < t);
+        self.t.insert(i, t);
+        self.meta.insert(i, ThMeta { eq_ok, calc, group });
+    }
 }
 
 /// (被盯类型, 字段) 的 type scope 订阅索引。
@@ -147,20 +263,15 @@ pub(crate) struct TypeIndex {
     /// 桶里出现过的去重路径（每写逐路径探一次桶）。
     bucket_paths: Vec<Vec<String>>,
     /// 共享排序阈值表：fires when new < t（或 ≤）。后缀范围查询 O(log s + k)。
-    lt: Vec<ThEntry>,
+    lt: ThTable,
     /// fires when new > t（或 ≥）。前缀范围查询。
-    gt: Vec<ThEntry>,
+    gt: ThTable,
     /// crossed(t, ↓)：old ≥ t ∧ new < t ⇔ t ∈ (new, old]。
-    cross_down: Vec<ThEntry>,
+    cross_down: ThTable,
     /// crossed(t, ↑)：old ≤ t ∧ new > t ⇔ t ∈ [old, new)。
-    cross_up: Vec<ThEntry>,
+    cross_up: ThTable,
     /// 退化路径：活阈值 / 复合条件——逐订阅者（§4 诚实退化条款）。
     scan: Vec<(CalcId, u32)>,
-}
-
-fn sorted_insert(v: &mut Vec<ThEntry>, e: ThEntry) {
-    let i = v.partition_point(|x| x.t < e.t);
-    v.insert(i, e);
 }
 
 impl TypeIndex {
@@ -221,10 +332,9 @@ impl TypeIndex {
                 // crossed(常量, dir) → 区间查询
                 Cond::Crossed(Expr::Val(ValRef::Const(v)), dir) => {
                     if let Some(t) = v.as_f64() {
-                        let e = ThEntry { t, eq_ok: false, calc, group };
                         match dir {
-                            Dir::Down => sorted_insert(&mut self.cross_down, e),
-                            Dir::Up => sorted_insert(&mut self.cross_up, e),
+                            Dir::Down => self.cross_down.insert(t, false, calc, group),
+                            Dir::Up => self.cross_up.insert(t, false, calc, group),
                         }
                         return;
                     }
@@ -239,15 +349,18 @@ impl TypeIndex {
         if !self.bucket_paths.contains(&path) {
             self.bucket_paths.push(path.clone());
         }
-        self.buckets.entry((path, k)).or_default().push((calc, group));
+        self.buckets
+            .entry((path, k))
+            .or_default()
+            .push((calc, group));
     }
 
     fn add_threshold(&mut self, op: CmpOp, t: f64, calc: CalcId, group: u32) -> bool {
         match op {
-            CmpOp::Lt => sorted_insert(&mut self.lt, ThEntry { t, eq_ok: false, calc, group }),
-            CmpOp::Le => sorted_insert(&mut self.lt, ThEntry { t, eq_ok: true, calc, group }),
-            CmpOp::Gt => sorted_insert(&mut self.gt, ThEntry { t, eq_ok: false, calc, group }),
-            CmpOp::Ge => sorted_insert(&mut self.gt, ThEntry { t, eq_ok: true, calc, group }),
+            CmpOp::Lt => self.lt.insert(t, false, calc, group),
+            CmpOp::Le => self.lt.insert(t, true, calc, group),
+            CmpOp::Gt => self.gt.insert(t, false, calc, group),
+            CmpOp::Ge => self.gt.insert(t, true, calc, group),
             _ => return false,
         }
         true
@@ -280,35 +393,39 @@ impl TypeIndex {
         }
         let (new, old) = (w.new.as_f64(), w.old.as_f64());
         if let Some(n) = new {
-            // lt 表：fires when n < t（或 ≤）——后缀 [partition_point ..)
-            let i = self.lt.partition_point(|e| e.t < n);
-            for e in &self.lt[i..] {
-                if e.t > n || e.eq_ok {
-                    hit(e.calc, e.group, None);
+            // lt 表：fires when n < t（或 ≤）——后缀 [partition_point ..)。二分只扫 .t
+            let i = self.lt.t.partition_point(|&t| t < n);
+            for k in i..self.lt.t.len() {
+                let m = &self.lt.meta[k];
+                if self.lt.t[k] > n || m.eq_ok {
+                    hit(m.calc, m.group, None);
                 }
             }
             // gt 表：fires when n > t（或 ≥）——前缀 [.. partition_point)
-            let j = self.gt.partition_point(|e| e.t <= n);
-            for e in &self.gt[..j] {
-                if e.t < n || e.eq_ok {
-                    hit(e.calc, e.group, None);
+            let j = self.gt.t.partition_point(|&t| t <= n);
+            for k in 0..j {
+                let m = &self.gt.meta[k];
+                if self.gt.t[k] < n || m.eq_ok {
+                    hit(m.calc, m.group, None);
                 }
             }
         }
         if let (Some(n), Some(o)) = (new, old) {
             if n < o {
                 // ↓：t ∈ (n, o]
-                let a = self.cross_down.partition_point(|e| e.t <= n);
-                let b = self.cross_down.partition_point(|e| e.t <= o);
-                for e in &self.cross_down[a..b] {
-                    hit(e.calc, e.group, None);
+                let a = self.cross_down.t.partition_point(|&t| t <= n);
+                let b = self.cross_down.t.partition_point(|&t| t <= o);
+                for k in a..b {
+                    let m = &self.cross_down.meta[k];
+                    hit(m.calc, m.group, None);
                 }
             } else if n > o {
                 // ↑：t ∈ [o, n)
-                let a = self.cross_up.partition_point(|e| e.t < o);
-                let b = self.cross_up.partition_point(|e| e.t < n);
-                for e in &self.cross_up[a..b] {
-                    hit(e.calc, e.group, None);
+                let a = self.cross_up.t.partition_point(|&t| t < o);
+                let b = self.cross_up.t.partition_point(|&t| t < n);
+                for k in a..b {
+                    let m = &self.cross_up.meta[k];
+                    hit(m.calc, m.group, None);
                 }
             }
         }
@@ -397,6 +514,7 @@ struct EvalCtx<'a> {
     old: &'a Value,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn route(
     store: &Store,
     idx: &Indexes,
@@ -405,9 +523,13 @@ pub(crate) fn route(
     scratch: &mut Scratch,
     writes: &[WriteRec],
     determinism: Determinism,
+    // 成员死亡撤销标脏的 fold（§6.3）：本帧无写也须重投递其新聚合值。
+    dirty_folds: &[(CalcId, InstanceId)],
 ) -> Vec<Trigger> {
     scratch.clear();
     let mut triggers: Vec<Trigger> = vec![];
+    // 谓词预编译求值的复用值栈（帧内一条，跨写/订阅者复用，零分配）。
+    let mut eval_stack: Vec<Value> = vec![];
 
     for w in writes {
         scratch.cond_memo.clear();
@@ -441,9 +563,24 @@ pub(crate) fn route(
                     if !store.alive(sub) {
                         continue;
                     }
-                    let ectx = EvalCtx { store, sub, new: &w.new, old: &w.old };
-                    if eval_cond(&rc.pred.cond, &ectx) {
-                        deliver(rc, c, group, sub, w, store, fold_state, scratch, &mut triggers);
+                    let ectx = EvalCtx {
+                        store,
+                        sub,
+                        new: &w.new,
+                        old: &w.old,
+                    };
+                    if rc.compiled.eval(&ectx, &mut eval_stack) {
+                        deliver(
+                            rc,
+                            c,
+                            group,
+                            sub,
+                            w,
+                            store,
+                            fold_state,
+                            scratch,
+                            &mut triggers,
+                        );
                     }
                 }
                 None => {
@@ -456,9 +593,13 @@ pub(crate) fn route(
                         {
                             Some(&(_, v)) => v,
                             None => {
-                                let ectx =
-                                    EvalCtx { store, sub: w.inst, new: &w.new, old: &w.old };
-                                let v = eval_cond(&rc.pred.cond, &ectx);
+                                let ectx = EvalCtx {
+                                    store,
+                                    sub: w.inst,
+                                    new: &w.new,
+                                    old: &w.old,
+                                };
+                                let v = rc.compiled.eval(&ectx, &mut eval_stack);
                                 scratch.cond_memo.push((rc.cond_class, v));
                                 v
                             }
@@ -467,15 +608,37 @@ pub(crate) fn route(
                             continue;
                         }
                         store.for_each_alive(rc.ty, |sub| {
-                            deliver(rc, c, group, sub, w, store, fold_state, scratch, &mut triggers);
+                            deliver(
+                                rc,
+                                c,
+                                group,
+                                sub,
+                                w,
+                                store,
+                                fold_state,
+                                scratch,
+                                &mut triggers,
+                            );
                         });
                     } else {
                         // 活阈值：逐订阅者点查（§4 诚实退化条款）
                         store.for_each_alive(rc.ty, |sub| {
-                            let ectx = EvalCtx { store, sub, new: &w.new, old: &w.old };
-                            if eval_cond(&rc.pred.cond, &ectx) {
+                            let ectx = EvalCtx {
+                                store,
+                                sub,
+                                new: &w.new,
+                                old: &w.old,
+                            };
+                            if rc.compiled.eval(&ectx, &mut eval_stack) {
                                 deliver(
-                                    rc, c, group, sub, w, store, fold_state, scratch,
+                                    rc,
+                                    c,
+                                    group,
+                                    sub,
+                                    w,
+                                    store,
+                                    fold_state,
+                                    scratch,
                                     &mut triggers,
                                 );
                             }
@@ -499,11 +662,24 @@ pub(crate) fn route(
             input: Input::Batch(rows.into_iter().map(|(_, r)| r).collect()),
         });
     }
+    // 成员死亡撤销标脏的 fold（§6.3）：并入本帧 fold 交付集（与写命中去重）。
+    // 死者对应的订阅者实例若仍存活，执行阶段会用撤销后的新聚合值重算。
+    for &(c, sub) in dirty_folds {
+        if fold_state.contains_key(&(c, sub)) && scratch.fold_seen.insert((c, sub)) {
+            scratch.fold_hits.push((c, sub));
+        }
+    }
     // fold：本帧有更新的聚合交付一次
     for &(c, sub) in &scratch.fold_hits {
-        let Delivery::Fold(op) = calcs[c.0 as usize].pred.delivery else { unreachable!() };
+        let Delivery::Fold(op) = calcs[c.0 as usize].pred.delivery else {
+            unreachable!()
+        };
         let v = fold_value(op, &fold_state[&(c, sub)]);
-        triggers.push(Trigger { calc: c, subscriber: sub, input: Input::Fold(v) });
+        triggers.push(Trigger {
+            calc: c,
+            subscriber: sub,
+            input: Input::Fold(v),
+        });
     }
     triggers
 }
@@ -551,6 +727,9 @@ fn deliver(
             buf.push((okey, project(projs, w, sub, store)));
         }
         Delivery::Fold(op) => {
+            if w.field != FIELD_ALIVE && !store.alive(w.inst) {
+                return;
+            }
             let st = fold_state.entry((c, sub)).or_insert_with(|| fold_init(*op));
             apply_fold(*op, st, w);
             if scratch.fold_seen.insert((c, sub)) {
@@ -574,31 +753,141 @@ pub(crate) fn project(projs: &[Proj], w: &WriteRec, sub: InstanceId, store: &Sto
 }
 
 // ---- 条件求值（§3.3 封闭集：new / old / own 字段 / 常量含 self）----
+//
+// 谓词预编译（白送优化）：注册期把 `Cond`/`Expr` AST 降为一段扁平后缀程序
+// （[`CompiledCond`]，数据非闭包），运行期是对连续 slice 的紧循环——去掉逐节点
+// Box 指针追逐与递归，并在编译期折叠常量子表达式。语义与原 AST 逐字等价。
 
-fn eval_val(v: &ValRef, c: &EvalCtx) -> Value {
-    match v {
-        ValRef::New(path) => c.new.get_path(path),
-        ValRef::Old(path) => c.old.get_path(path),
-        ValRef::Own(f) => c.store.read(c.sub, *f),
-        ValRef::Const(v) => v.clone(),
-        ValRef::SelfRef => Value::Ref(c.sub),
+/// 谓词条件的预编译形。与架构「行为→数据（kernel IR）+ 可插拔派发」方向一致。
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledCond {
+    ops: Vec<COp>,
+}
+
+/// 后缀程序指令。值型指令把一个 Value 压栈；布尔型指令读 ctx / 弹栈并压 Bool。
+#[derive(Debug, Clone)]
+enum COp {
+    // —— 值产出 ——
+    New(Vec<String>),
+    Old(Vec<String>),
+    Own(FieldId),
+    Const(Value),
+    SelfRef,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    // —— 布尔产出 ——
+    Cmp(CmpOp),
+    InRange(f64, f64),
+    InSet(Vec<Value>),
+    Changed,
+    Became(Value),
+    Crossed(Dir),
+    And,
+    Or,
+    AndNot,
+}
+
+impl CompiledCond {
+    pub(crate) fn compile(cond: &Cond) -> CompiledCond {
+        let mut ops = vec![];
+        compile_cond(cond, &mut ops);
+        CompiledCond { ops }
+    }
+
+    /// 求值。`stack` 是 route 帧内复用的值栈（零分配）。
+    fn eval(&self, c: &EvalCtx, stack: &mut Vec<Value>) -> bool {
+        stack.clear();
+        for op in &self.ops {
+            match op {
+                COp::New(p) => stack.push(c.new.get_path(p)),
+                COp::Old(p) => stack.push(c.old.get_path(p)),
+                COp::Own(f) => stack.push(c.store.read(c.sub, *f)),
+                COp::Const(v) => stack.push(v.clone()),
+                COp::SelfRef => stack.push(Value::Ref(c.sub)),
+                COp::Add => bin_arith(stack, |x, y| x + y),
+                COp::Sub => bin_arith(stack, |x, y| x - y),
+                COp::Mul => bin_arith(stack, |x, y| x * y),
+                COp::Div => bin_arith(stack, |x, y| x / y),
+                COp::Cmp(op) => {
+                    let r = stack.pop().unwrap_or(Value::Null);
+                    let l = stack.pop().unwrap_or(Value::Null);
+                    stack.push(Value::Bool(cmp_op(&l, *op, &r)));
+                }
+                COp::InRange(a, b) => {
+                    let hit = c.new.as_f64().is_some_and(|v| v >= *a && v <= *b);
+                    stack.push(Value::Bool(hit));
+                }
+                COp::InSet(vs) => {
+                    let hit = vs.iter().any(|v| val_eq(v, c.new));
+                    stack.push(Value::Bool(hit));
+                }
+                // D2 写即事件；「值真的变了」显式问
+                COp::Changed => stack.push(Value::Bool(!val_eq(c.new, c.old))),
+                COp::Became(v) => {
+                    stack.push(Value::Bool(val_eq(c.new, v) && !val_eq(c.old, v)));
+                }
+                // 边沿穿越（双缓冲旧值免费，O(1)，§4）
+                COp::Crossed(dir) => {
+                    let t = stack.pop().unwrap_or(Value::Null);
+                    let hit = match (t.as_f64(), c.old.as_f64(), c.new.as_f64()) {
+                        (Some(t), Some(old), Some(new)) => match dir {
+                            Dir::Down => old >= t && new < t,
+                            Dir::Up => old <= t && new > t,
+                        },
+                        _ => false,
+                    };
+                    stack.push(Value::Bool(hit));
+                }
+                COp::And => {
+                    let (b, a) = (pop_bool(stack), pop_bool(stack));
+                    stack.push(Value::Bool(a && b));
+                }
+                COp::Or => {
+                    let (b, a) = (pop_bool(stack), pop_bool(stack));
+                    stack.push(Value::Bool(a || b));
+                }
+                // 否定仅作守卫（§3.3）：仍需正触发源，稀疏性不破
+                COp::AndNot => {
+                    let (b, a) = (pop_bool(stack), pop_bool(stack));
+                    stack.push(Value::Bool(a && !b));
+                }
+            }
+        }
+        matches!(stack.pop(), Some(Value::Bool(true)))
     }
 }
 
-fn eval_expr(e: &Expr, c: &EvalCtx) -> Value {
-    match e {
-        Expr::Val(v) => eval_val(v, c),
-        Expr::Add(a, b) => arith(a, b, c, |x, y| x + y),
-        Expr::Sub(a, b) => arith(a, b, c, |x, y| x - y),
-        Expr::Mul(a, b) => arith(a, b, c, |x, y| x * y),
-        Expr::Div(a, b) => arith(a, b, c, |x, y| x / y),
+fn pop_bool(stack: &mut Vec<Value>) -> bool {
+    matches!(stack.pop(), Some(Value::Bool(true)))
+}
+
+/// pop r, pop l；两者皆数值则压 Float(f(l,r))，否则压 Null（与原 arith 等价）。
+fn bin_arith(stack: &mut Vec<Value>, f: fn(f64, f64) -> f64) {
+    let r = stack.pop().unwrap_or(Value::Null);
+    let l = stack.pop().unwrap_or(Value::Null);
+    match (l.as_f64(), r.as_f64()) {
+        (Some(x), Some(y)) => stack.push(Value::Float(f(x, y))),
+        _ => stack.push(Value::Null),
     }
 }
 
-fn arith(a: &Expr, b: &Expr, c: &EvalCtx, f: fn(f64, f64) -> f64) -> Value {
-    match (eval_expr(a, c).as_f64(), eval_expr(b, c).as_f64()) {
-        (Some(x), Some(y)) => Value::Float(f(x, y)),
-        _ => Value::Null,
+/// 比较语义：Eq/Ne 走数值感知判等；序比较跨数值类型按 f64，非数值不可比 → false。
+fn cmp_op(l: &Value, op: CmpOp, r: &Value) -> bool {
+    match op {
+        CmpOp::Eq => val_eq(l, r),
+        CmpOp::Ne => !val_eq(l, r),
+        _ => match l.cmp_num(r) {
+            Some(o) => match op {
+                CmpOp::Lt => o.is_lt(),
+                CmpOp::Le => o.is_le(),
+                CmpOp::Gt => o.is_gt(),
+                CmpOp::Ge => o.is_ge(),
+                _ => unreachable!(),
+            },
+            None => false,
+        },
     }
 }
 
@@ -610,46 +899,92 @@ fn val_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn eval_cond(cond: &Cond, c: &EvalCtx) -> bool {
+fn compile_cond(cond: &Cond, ops: &mut Vec<COp>) {
     match cond {
-        Cond::True => true,
+        Cond::True => ops.push(COp::Const(Value::Bool(true))),
         Cond::Cmp(l, op, r) => {
-            let (lv, rv) = (eval_expr(l, c), eval_expr(r, c));
-            match op {
-                CmpOp::Eq => val_eq(&lv, &rv),
-                CmpOp::Ne => !val_eq(&lv, &rv),
-                _ => match lv.cmp_num(&rv) {
-                    Some(o) => match op {
-                        CmpOp::Lt => o.is_lt(),
-                        CmpOp::Le => o.is_le(),
-                        CmpOp::Gt => o.is_gt(),
-                        CmpOp::Ge => o.is_ge(),
-                        _ => unreachable!(),
-                    },
-                    None => false,
-                },
-            }
+            compile_expr(l, ops);
+            compile_expr(r, ops);
+            ops.push(COp::Cmp(*op));
         }
-        Cond::InRange(a, b) => c.new.as_f64().is_some_and(|v| v >= *a && v <= *b),
-        Cond::InSet(vs) => vs.iter().any(|v| val_eq(v, c.new)),
-        // D2 写即事件；「值真的变了」显式问
-        Cond::Changed => !val_eq(c.new, c.old),
-        Cond::Became(v) => val_eq(c.new, v) && !val_eq(c.old, v),
-        // 边沿穿越（双缓冲旧值免费，O(1)，§4）
+        Cond::InRange(a, b) => ops.push(COp::InRange(*a, *b)),
+        Cond::InSet(vs) => ops.push(COp::InSet(vs.clone())),
+        Cond::Changed => ops.push(COp::Changed),
+        Cond::Became(v) => ops.push(COp::Became(v.clone())),
         Cond::Crossed(t, dir) => {
-            let (Some(t), Some(old), Some(new)) =
-                (eval_expr(t, c).as_f64(), c.old.as_f64(), c.new.as_f64())
-            else {
-                return false;
-            };
-            match dir {
-                Dir::Down => old >= t && new < t,
-                Dir::Up => old <= t && new > t,
-            }
+            compile_expr(t, ops);
+            ops.push(COp::Crossed(*dir));
         }
-        Cond::And(a, b) => eval_cond(a, c) && eval_cond(b, c),
-        Cond::Or(a, b) => eval_cond(a, c) || eval_cond(b, c),
-        // 否定仅作守卫（§3.3）：仍需正触发源，稀疏性不破
-        Cond::AndNot(a, b) => eval_cond(a, c) && !eval_cond(b, c),
+        Cond::And(a, b) => {
+            compile_cond(a, ops);
+            compile_cond(b, ops);
+            ops.push(COp::And);
+        }
+        Cond::Or(a, b) => {
+            compile_cond(a, ops);
+            compile_cond(b, ops);
+            ops.push(COp::Or);
+        }
+        Cond::AndNot(a, b) => {
+            compile_cond(a, ops);
+            compile_cond(b, ops);
+            ops.push(COp::AndNot);
+        }
+    }
+}
+
+/// 编译表达式；全常量子树在编译期折叠为单个 Const。
+fn compile_expr(e: &Expr, ops: &mut Vec<COp>) {
+    if let Some(v) = const_fold(e) {
+        ops.push(COp::Const(v));
+        return;
+    }
+    match e {
+        Expr::Val(ValRef::New(p)) => ops.push(COp::New(p.clone())),
+        Expr::Val(ValRef::Old(p)) => ops.push(COp::Old(p.clone())),
+        Expr::Val(ValRef::Own(f)) => ops.push(COp::Own(*f)),
+        Expr::Val(ValRef::Const(v)) => ops.push(COp::Const(v.clone())),
+        Expr::Val(ValRef::SelfRef) => ops.push(COp::SelfRef),
+        Expr::Add(a, b) => {
+            compile_expr(a, ops);
+            compile_expr(b, ops);
+            ops.push(COp::Add);
+        }
+        Expr::Sub(a, b) => {
+            compile_expr(a, ops);
+            compile_expr(b, ops);
+            ops.push(COp::Sub);
+        }
+        Expr::Mul(a, b) => {
+            compile_expr(a, ops);
+            compile_expr(b, ops);
+            ops.push(COp::Mul);
+        }
+        Expr::Div(a, b) => {
+            compile_expr(a, ops);
+            compile_expr(b, ops);
+            ops.push(COp::Div);
+        }
+    }
+}
+
+/// 全常量表达式的编译期求值；非全常量返回 None。
+/// 与运行期 arith 等价：裸常量原样返回，算术返回 Float。
+fn const_fold(e: &Expr) -> Option<Value> {
+    match e {
+        Expr::Val(ValRef::Const(v)) => Some(v.clone()),
+        Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) => {
+            let x = const_fold(a)?.as_f64()?;
+            let y = const_fold(b)?.as_f64()?;
+            let r = match e {
+                Expr::Add(..) => x + y,
+                Expr::Sub(..) => x - y,
+                Expr::Mul(..) => x * y,
+                Expr::Div(..) => x / y,
+                _ => unreachable!(),
+            };
+            Some(Value::Float(r))
+        }
+        _ => None,
     }
 }

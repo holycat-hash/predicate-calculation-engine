@@ -13,6 +13,7 @@ use crate::value::Value;
 
 use super::{Store, WriteRec};
 
+#[derive(Clone)]
 pub struct Clock {
     pub ty: EntityTypeId,
     pub inst: InstanceId,
@@ -25,7 +26,11 @@ impl Clock {
     pub(crate) fn placeholder() -> Self {
         Clock {
             ty: EntityTypeId(0),
-            inst: InstanceId { ty: EntityTypeId(0), id: 0, generation: 0 },
+            inst: InstanceId {
+                ty: EntityTypeId(0),
+                id: 0,
+                generation: 0,
+            },
             f_frame: FieldId(0),
             f_alarm: FieldId(0),
             alarms: HashMap::new(),
@@ -38,25 +43,40 @@ impl Clock {
         f_frame: FieldId,
         f_alarm: FieldId,
     ) -> Self {
-        Clock { ty, inst, f_frame, f_alarm, alarms: HashMap::new() }
+        Clock {
+            ty,
+            inst,
+            f_frame,
+            f_alarm,
+            alarms: HashMap::new(),
+        }
     }
 
     pub(crate) fn set_alarm(&mut self, at_frame: u64, payload: Value) {
         self.alarms.entry(at_frame).or_default().push(payload);
     }
 
-    /// 每帧由 runtime 调用：写 Clock.frame；到点的 alarm 逐条写入
+    /// 每帧由 runtime 调用：产出 Clock.frame 写；到点的 alarm 逐条产出写
     /// （D2 写即事件：多条 alarm 是多条 write，各自触发订阅者）。
-    pub(crate) fn tick(&mut self, frame: u64, store: &mut Store, w: &mut Vec<WriteRec>) {
+    /// 注意这里只生成 write log，不提前改 store，保证本帧 calculation 仍读到上一帧快照。
+    pub(crate) fn tick(&mut self, frame: u64, store: &Store, w: &mut Vec<WriteRec>) {
         let old = store.read(self.inst, self.f_frame);
         let new = Value::Int(frame as i64);
-        store.set(self.inst, self.f_frame, new.clone());
-        w.push(WriteRec { inst: self.inst, field: self.f_frame, old, new });
+        w.push(WriteRec {
+            inst: self.inst,
+            field: self.f_frame,
+            old,
+            new,
+        });
         if let Some(payloads) = self.alarms.remove(&frame) {
+            let old = store.read(self.inst, self.f_alarm);
             for p in payloads {
-                let old = store.read(self.inst, self.f_alarm);
-                store.set(self.inst, self.f_alarm, p.clone());
-                w.push(WriteRec { inst: self.inst, field: self.f_alarm, old, new: p });
+                w.push(WriteRec {
+                    inst: self.inst,
+                    field: self.f_alarm,
+                    old: old.clone(),
+                    new: p,
+                });
             }
         }
     }

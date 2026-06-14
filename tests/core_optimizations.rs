@@ -518,6 +518,96 @@ fn core_registration_reports_d1_conflict() {
     assert!(err.contains("D1"), "{err}");
 }
 
+/// 注册失败必须是事务式失败：不能污染 D1 owner 表或路由索引。
+#[test]
+fn failed_registration_does_not_poison_runtime() {
+    let mut rt = Runtime::new();
+    let unit = entity(&mut rt, "Unit", vec![field("v", 0)]);
+    let f_v = rt.field(unit, "v");
+
+    let bad_owner = register(
+        &mut rt,
+        "bad_owner",
+        unit,
+        Predicate::new(
+            Scope::And(Box::new(own(f_v)), Box::new(own(f_v))),
+            Cond::True,
+            Delivery::Batch(vec![]),
+        ),
+        &[f_v],
+        |_, _| {},
+    );
+    assert!(bad_owner.is_err());
+    assert!(
+        register(
+            &mut rt,
+            "good_after_bad_owner",
+            unit,
+            Predicate::new(own(f_v), Cond::True, Delivery::Each(vec![])),
+            &[f_v],
+            move |ctx, _| ctx.write(f_v, 1),
+        )
+        .is_ok(),
+        "失败注册不应占住 D1 owner"
+    );
+
+    let mut rt = Runtime::new();
+    let unit = entity(&mut rt, "Unit", vec![field("v", 0)]);
+    let f_v = rt.field(unit, "v");
+    let bad_index = register(
+        &mut rt,
+        "bad_index",
+        unit,
+        Predicate::new(
+            Scope::Or(Box::new(own(f_v)), Box::new(own(FieldId(999)))),
+            Cond::True,
+            Delivery::Each(vec![]),
+        ),
+        &[],
+        |_, _| {},
+    );
+    assert!(bad_index.is_err());
+
+    let u = rt.spawn(unit, vec![]);
+    rt.step();
+    rt.debug_write(u, f_v, Value::Int(1));
+    rt.step(); // 若索引被污染，这里会路由到不存在的 CalcId 并 panic。
+}
+
+/// OR scope 中重复原子不应让同一 write 重复交付。
+#[test]
+fn duplicate_or_atom_delivers_once() {
+    let mut rt = Runtime::new();
+    let unit = entity(&mut rt, "Unit", vec![field("v", 0)]);
+    let sink = singleton(&mut rt, "Sink", vec![field("rows", 0)]);
+    let f_v = rt.field(unit, "v");
+    let f_rows = rt.field(sink, "rows");
+
+    register(
+        &mut rt,
+        "collect",
+        sink,
+        Predicate::new(
+            Scope::Or(
+                Box::new(type_scope(unit, f_v)),
+                Box::new(type_scope(unit, f_v)),
+            ),
+            Cond::True,
+            Delivery::Batch(vec![new_proj()]),
+        ),
+        &[f_rows],
+        move |ctx, input| ctx.write(f_rows, input.rows().len() as i64),
+    )
+    .unwrap();
+
+    let u = rt.spawn(unit, vec![]);
+    let s0 = rt.alive(sink)[0];
+    rt.step();
+    rt.debug_write(u, f_v, Value::Int(7));
+    rt.step();
+    assert_eq!(rt.read(s0, f_rows), Value::Int(1));
+}
+
 /// scope 并（|）与活阈值条件（own 字段）走诚实退化路径仍正确。
 #[test]
 fn live_threshold_and_scope_union() {

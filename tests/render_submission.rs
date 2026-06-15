@@ -110,6 +110,57 @@ fn slerp_normalizes_non_unit_quats_and_alpha_nan_is_safe() {
     );
 }
 
+#[test]
+fn out_default_types_track_output_column_by_interp_kind() {
+    // track() 用 out_default 给输出 render 字段定型：种类决定输出类型（与 sample 的产出
+    // 一致），列即按该类型无装箱定型，而非恒 Null→Boxed 丢掉 render 最热 transform 插值
+    // 输出的去装箱收益。Snap/Step 透传源类型；Lerp/Vec3Lerp/Slerp 各自定型（与源无关）。
+    assert_eq!(Interp::Snap.out_default(&Value::Int(7)), Value::Int(7));
+    assert_eq!(
+        Interp::Step.out_default(&Value::Bool(true)),
+        Value::Bool(true)
+    );
+    assert_eq!(Interp::Lerp.out_default(&Value::Int(3)), Value::Float(3.0));
+    assert_eq!(
+        Interp::Vec3Lerp.out_default(&Value::Null),
+        Value::vec3(0.0, 0.0, 0.0),
+        "源非 Vec3（量纲错配）退向量零元，仍是 Vec3 而非 Null"
+    );
+    assert_eq!(
+        Interp::Slerp.out_default(&Value::Null),
+        Value::quat_identity(),
+        "源非 Quat 退单位四元数，仍是 Quat 而非 Null"
+    );
+    assert_eq!(
+        Interp::Vec3Lerp.out_default(&Value::vec3(1.0, 2.0, 3.0)),
+        Value::vec3(1.0, 2.0, 3.0),
+        "源已是目标型则原样保留"
+    );
+}
+
+#[test]
+fn vec3_track_with_null_default_births_to_typed_fallback() {
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![FieldDef::new("pos", Value::Null)], false);
+    let f_pos = rt.field(unit, "pos");
+    rt.enable_render_feed();
+
+    let mut rr = RenderRuntime::new(&rt);
+    let r_pos = rr.track(unit, f_pos, Interp::Vec3Lerp).unwrap();
+    let publisher = Publisher::new(rr.tracked_fields());
+
+    let u = rt.spawn(unit, vec![]);
+    rt.step();
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 1.0);
+
+    assert_eq!(
+        rr.read(u, r_pos),
+        Value::vec3(0.0, 0.0, 0.0),
+        "量纲未知的 Vec3Lerp 出生输出应保持 Vec3 定型默认值，而非写 Null 打回 Boxed"
+    );
+}
+
 // ---- track → submission 端到端 ----
 
 /// Unit{pos:Vec3, rot:Quat, mesh:Int, mat:Int}，挂 pos += (10,0,0) 的 ECS mover。
@@ -174,11 +225,11 @@ fn transform_track_flows_into_submission_packet() {
 
     let u = rt.spawn(unit, vec![(f_mesh, Value::Int(7)), (f_mat, Value::Int(3))]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     rr.sync(&publisher, 0.016, 1.0); // 出生帧 snap
 
     rt.step();
-    publisher.publish(&rt, 2);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
     rr.render_frame(0.016, 0.5); // pos 区间 [0,0,0]→[10,0,0]，半程
 
@@ -210,13 +261,13 @@ fn same_frame_tracked_writes_fold_to_first_old_and_last_new() {
 
     let u = rt.spawn(unit, vec![(f_pos, Value::Int(0))]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     rr.sync(&publisher, 0.016, 1.0);
 
     rt.debug_write(u, f_pos, Value::Int(10));
     rt.debug_write(u, f_pos, Value::Int(20));
     rt.step();
-    publisher.publish(&rt, 2);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
     assert_eq!(
         rr.active_count(),
@@ -312,13 +363,13 @@ fn submission_culls_invisible_entities() {
     let a = rt.spawn(unit, vec![(f_hp, Value::Int(30))]);
     let b = rt.spawn(unit, vec![(f_hp, Value::Int(30))]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     rr.sync(&publisher, 0.016, 1.0);
     assert_eq!(rr.submit().len(), 2, "两个实体都可见");
 
     rt.debug_write(a, f_hp, Value::Int(0)); // a 死，反应隐藏 a
     rt.step();
-    publisher.publish(&rt, 2);
+    publisher.publish(&rt);
     rr.sync(&publisher, 0.016, 1.0);
     let view = rr.submit();
     assert_eq!(view.len(), 1, "a 被剔除，仅 b 进提交");
@@ -349,16 +400,16 @@ fn death_fade_defers_reclaim_then_collects() {
 
     let u = rt.spawn(unit, vec![(f_hp, Value::Int(30))]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     rr.sync(&publisher, 0.1, 1.0);
     assert_eq!(rr.submit().len(), 1, "存活：进提交");
 
     // sim 杀死 u：render 不即时回收，进入淡出。
     rt.destroy(u);
     rt.step();
-    publisher.publish(&rt, 2);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher); // 仅摄入：dying 入列、剩余=1.0、fade 仍默认 1.0
-    assert!(rr.alive(u), "淡出期内 render 侧仍存活");
+    assert!(rr.is_present(u), "淡出期内 render 侧仍在场");
     assert_eq!(rr.dying_count(), 1);
 
     // 每帧 dt=0.25：fade 1→0.75→0.5→0.25→0（第 4 帧回收）。
@@ -369,10 +420,10 @@ fn death_fade_defers_reclaim_then_collects() {
         let view = rr.submit();
         assert_eq!(view.len(), 1, "淡出中仍进提交");
         assert!(approx(view.packets[0].fade, want), "提交包带淡出权重");
-        assert!(rr.alive(u), "未淡尽仍存活");
+        assert!(rr.is_present(u), "未淡尽仍在场");
     }
     rr.render_frame(0.25, 1.0); // 剩余 0 → 回收
-    assert!(!rr.alive(u), "淡尽：render 行回收");
+    assert!(!rr.is_present(u), "淡尽：render 行回收");
     assert_eq!(rr.dying_count(), 0);
     assert_eq!(rr.submit().len(), 0, "回收后不再进提交");
 }
@@ -390,7 +441,7 @@ fn duplicate_deaths_do_not_duplicate_or_reset_fade() {
 
     let u = rt.spawn(unit, vec![]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
 
     rr.ingest(&SimFrame {
@@ -416,6 +467,22 @@ fn duplicate_deaths_do_not_duplicate_or_reset_fade() {
 }
 
 #[test]
+fn death_fade_rejects_non_finite_or_non_positive_duration() {
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![FieldDef::new("hp", Value::Int(30))], false);
+    rt.enable_render_feed();
+
+    for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut rr = RenderRuntime::new(&rt);
+        let r_fade = rr.add_render_field(unit, Value::Float(1.0));
+        assert!(
+            rr.set_death_fade(unit, r_fade, bad).is_err(),
+            "非法淡出时长 {bad:?} 必须在注册期被拒绝"
+        );
+    }
+}
+
+#[test]
 fn same_frame_respawn_does_not_leave_old_generation_dying() {
     let mut rt = Runtime::new();
     let unit = rt.register_entity_type("Unit", vec![FieldDef::new("hp", Value::Int(30))], false);
@@ -429,14 +496,14 @@ fn same_frame_respawn_does_not_leave_old_generation_dying() {
 
     let a = rt.spawn(unit, vec![(f_hp, Value::Int(30))]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
 
     rt.destroy(a);
     let b = rt.spawn(unit, vec![(f_hp, Value::Int(30))]);
     assert_eq!(a.id, b.id, "sim 同帧复用 id");
     rt.step();
-    publisher.publish(&rt, 2);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
 
     assert_eq!(
@@ -444,8 +511,42 @@ fn same_frame_respawn_does_not_leave_old_generation_dying() {
         0,
         "旧代 death 被同帧新生夺回，不留空转尸体"
     );
-    assert!(!rr.alive(a));
-    assert!(rr.alive(b));
+    assert!(!rr.is_present(a));
+    assert!(rr.is_present(b));
+}
+
+#[test]
+fn same_frame_respawn_does_not_keep_old_generation_active_track() {
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![FieldDef::new("pos", Value::Int(0))], false);
+    let f_pos = rt.field(unit, "pos");
+    rt.enable_render_feed();
+
+    let mut rr = RenderRuntime::new(&rt);
+    let r_pos = rr.track(unit, f_pos, Interp::Lerp).unwrap();
+    let publisher = Publisher::new(rr.tracked_fields());
+
+    let a = rt.spawn(unit, vec![(f_pos, Value::Int(0))]);
+    rt.step();
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 1.0);
+
+    rt.debug_write(a, f_pos, Value::Int(10));
+    rt.destroy(a);
+    let b = rt.spawn(unit, vec![(f_pos, Value::Int(20))]);
+    assert_eq!(a.id, b.id, "sim 同帧复用 id");
+    rt.step();
+    publisher.publish(&rt);
+    pump(&mut rr, &publisher);
+
+    assert_eq!(
+        rr.active_count(),
+        1,
+        "只有新 generation 的 track 留在 active"
+    );
+    rr.render_frame(0.016, 1.0);
+    assert_eq!(rr.read(b, r_pos), Value::Float(20.0));
+    assert_eq!(rr.read(a, r_pos), Value::Null, "旧 generation 不可读");
 }
 
 #[test]
@@ -463,12 +564,12 @@ fn death_fade_reclaim_prunes_active_tracks() {
 
     let u = rt.spawn(unit, vec![(f_pos, Value::Int(0))]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
 
     rt.debug_write(u, f_pos, Value::Int(10));
     rt.step();
-    publisher.publish(&rt, 2);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
     assert_eq!(rr.active_count(), 1);
 
@@ -478,7 +579,7 @@ fn death_fade_reclaim_prunes_active_tracks() {
         ..Default::default()
     });
     rr.render_frame(0.5, 1.0);
-    assert!(!rr.alive(u));
+    assert!(!rr.is_present(u));
     assert_eq!(rr.dying_count(), 0);
     assert_eq!(rr.active_count(), 0, "淡尽回收同步清 active 稀疏集");
 }
@@ -505,26 +606,26 @@ fn respawn_during_fade_reclaims_corpse_immediately() {
 
     let a = rt.spawn(unit, vec![(f_hp, Value::Int(30))]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     rr.sync(&publisher, 0.1, 1.0);
 
     rt.destroy(a);
     rt.step();
-    publisher.publish(&rt, 2);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
     rr.render_frame(0.3, 1.0); // a 淡到 0.7，仍在淡出
     assert_eq!(rr.dying_count(), 1);
-    assert!(rr.alive(a));
+    assert!(rr.is_present(a));
 
     // sim 复用 a 的 id 重生 b（新代际）。render 出生摄入应即时夺回行、清淡出残项。
     let b = rt.spawn(unit, vec![(f_hp, Value::Int(30))]);
     assert_eq!(b.id, a.id, "sim 复用了同一 id");
     rt.step();
-    publisher.publish(&rt, 3);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
     assert_eq!(rr.dying_count(), 0, "重生清除了淡出尸体");
-    assert!(rr.alive(b), "新住户存活");
-    assert!(!rr.alive(a), "旧代际尸体不再可达");
+    assert!(rr.is_present(b), "新住户在场");
+    assert!(!rr.is_present(a), "旧代际尸体不再可达");
     assert!(
         approx(rr.read(b, r_fade).as_f64().unwrap(), 1.0),
         "新住户实心（出生重置 fade）"
@@ -576,7 +677,7 @@ fn animation_state_switch_resets_phase_and_advances() {
 
     let u = rt.spawn(unit, vec![(f_action, Value::Int(0))]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     rr.sync(&publisher, 0.1, 1.0); // mirror=0=state → 推进：phase 0→0.1
     rr.render_frame(0.1, 1.0); //                       phase 0.1→0.2
     assert!(
@@ -587,7 +688,7 @@ fn animation_state_switch_resets_phase_and_advances() {
     // sim 切动作 → 状态切换、进度归零。
     rt.debug_write(u, f_action, Value::Int(2));
     rt.step();
-    publisher.publish(&rt, 2);
+    publisher.publish(&rt);
     rr.sync(&publisher, 0.1, 1.0); // mirror=2≠state(0) → 切换 state=2、phase=0
     let view = rr.submit();
     assert_eq!(view.packets[0].anim_state, Value::Int(2), "动画态切到 2");

@@ -65,7 +65,11 @@
 //! 灰区（B 层）自适应所需的遥测由 [`runtime::Profile`] 零边际成本提供（D2 买单）。
 
 pub mod calculation;
+/// 共享类型化去装箱列内核（sim 存储与 render sidecar 的数据底座，crate 内部）。
+pub(crate) mod column;
 pub mod entity;
+/// 共享代际 / 存活槽表（sim 行存与 render sidecar 的行 / 存活内核底座，crate 内部）。
+pub(crate) mod genslots;
 pub mod predicate;
 pub mod render;
 pub mod runtime;
@@ -77,7 +81,7 @@ pub use entity::{CellAddr, EntityTypeId, FieldDef, FieldId, InstanceId};
 pub use predicate::{CmpOp, Cond, Delivery, Dir, Expr, FoldOp, Predicate, Proj, Scope, ValRef};
 pub use render::{
     Interp, Publisher, RFieldId, RenderBinding, RenderClock, RenderCtx, RenderInput, RenderPacket,
-    RenderRuntime, RenderStore, SimFrame, SubmissionView,
+    RenderRuntime, SimFrame, SubmissionView,
 };
 pub use runtime::{
     CalcOptions, Detect, Determinism, Profile, Residency, RowPolicy, Runtime, Schedule,

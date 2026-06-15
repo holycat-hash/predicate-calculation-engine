@@ -60,7 +60,7 @@ pub struct SpatialGrid {
 
 /// 升序确定键：让查询结果有确定序（lockstep / 回放友好，配合 C4 Canonical）。
 #[inline]
-fn key(i: &InstanceId) -> (u32, u32, u32) {
+fn key(i: &InstanceId) -> (u32, u32, u64) {
     (i.ty.0, i.id, i.generation)
 }
 

@@ -75,9 +75,10 @@ impl Publisher {
 
     /// 从 sim runtime 当前帧的提交写集构建一份 [`SimFrame`]，发布给 render。
     /// 在 sim 线程、`rt.step()` 之后调用（此刻 `committed_writes` = 本帧写日志）。
-    pub fn publish(&self, rt: &Runtime, sim_frame: u64) {
+    /// 帧号直接取自 [`Runtime::frame`]，避免调用方手填造成重复摄入或跳帧。
+    pub fn publish(&self, rt: &Runtime) {
         let mut frame = SimFrame {
-            sim_frame,
+            sim_frame: rt.frame(),
             ..Default::default()
         };
         let mut tracked_of: HashMap<(InstanceId, FieldId), usize> = HashMap::new();

@@ -200,7 +200,7 @@ pub(crate) enum VKey {
     Null,
     Int(i64),
     Str(String),
-    Ref(EntityTypeId, u32, u32),
+    Ref(EntityTypeId, u32, u64),
 }
 
 fn vkey(v: &Value) -> Option<VKey> {
@@ -492,7 +492,7 @@ pub(crate) struct Scratch {
     cond_memo: Vec<(u32, bool)>,
 }
 
-type BatchKey = (u32, u32, u32, u32);
+type BatchKey = (u32, u32, u64, u32);
 
 impl Scratch {
     fn clear(&mut self) {

@@ -64,7 +64,7 @@ impl<'a> RenderCtx<'a> {
         self.clock.dt
     }
 
-    /// 插值因子 ∈ [0,1]。
+    /// 插值因子 ∈ `[0,1]`。
     pub fn alpha(&self) -> f64 {
         self.clock.alpha
     }
@@ -92,5 +92,5 @@ impl<'a> RenderCtx<'a> {
 /// render 事件反应：挂在 sim 写谓词之后。签名 (ctx, input)。
 pub type ReactionFn = Box<dyn Fn(&mut RenderCtx, &RenderInput) + Send + Sync>;
 
-/// render 连续更新：render clock 每帧对每个存活实例运行一次。签名 (ctx)。
+/// render 连续更新：render clock 每帧对每个在场实例运行一次。签名 (ctx)。
 pub type ContinuousFn = Box<dyn Fn(&mut RenderCtx) + Send + Sync>;

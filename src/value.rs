@@ -67,7 +67,7 @@ impl Value {
     }
 
     /// 沿字段路径取值；路径为空返回自身。路径落空返回 Null。
-    /// Vec3/Quat 的分量（`x`/`y`/`z`[`/w`]）是终端标量，可被路径直读——谓词条件
+    /// Vec3/Quat 的分量（`x`/`y`/`z`/`w`）是终端标量，可被路径直读——谓词条件
     /// 与 render 反应投影因此能引用 `new.pos.x` 这类单分量。
     pub fn get_path(&self, path: &[String]) -> Value {
         let mut cur = self;

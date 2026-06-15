@@ -19,7 +19,7 @@
 //!   （`fold` 的 render 对偶，runtime 自动每帧维护，calc 不手算）。
 //! - [`RenderRuntime::reaction`]：sim 写谓词 → render 字段写（死亡淡出、命中火花、
 //!   状态切换起动画）。v1 订阅者 = writer 本身。
-//! - [`RenderRuntime::continuous`]：render clock 每帧对每个存活实例运行（相机阻尼、
+//! - [`RenderRuntime::continuous`]：render clock 每帧对每个在场实例运行（相机阻尼、
 //!   派生 transform）。
 //!
 //! ## 成本（render 侧不变量）
@@ -32,22 +32,24 @@ pub mod clock;
 pub mod ctx;
 pub mod handoff;
 pub mod interp;
-pub mod store;
+mod store;
 pub mod submission;
 
 pub use clock::RenderClock;
 pub use ctx::{ContinuousFn, ReactionFn, RenderCtx, RenderInput};
 pub use handoff::{Publisher, SimFrame, TrackedDelta};
 pub use interp::{Interp, Track};
-pub use store::{RFieldId, RenderStore};
+pub use store::RFieldId;
 pub use submission::{RenderBinding, RenderPacket, SubmissionView};
 
 use std::collections::{HashMap, HashSet};
 
 use crate::entity::{EntityTypeId, FieldId, InstanceId};
 use crate::predicate::{Cond, Expr, Proj, ValRef};
-use crate::runtime::{project_ro, CompiledCond, Detect, Runtime};
+use crate::runtime::{CompiledCond, Detect, Runtime, project_ro};
 use crate::value::Value;
+
+use store::RenderStore;
 
 struct Reaction {
     /// D1 / C5 检测消息里用作 owner 名。
@@ -161,7 +163,9 @@ impl RenderRuntime {
             .get(&(ty, sim_field))
             .cloned()
             .unwrap_or(Value::Null);
-        let out = self.store.add_render_field(ty, Value::Null);
+        // 输出字段按插值种类定型（Vec3Lerp→Vec3 / Slerp→Quat / Lerp→Float / Snap·Step→源型），
+        // 而非恒 Null——否则输出列落 Boxed，render 最热的每帧 transform 插值输出丢去装箱收益。
+        let out = self.store.add_render_field(ty, kind.out_default(&default));
         // 输出字段走 D1 登记（out 恒为新铸 id，但宿主可手构 RFieldId 抢注，故仍检查）。
         self.claim_writes(ty, &[out], &format!("track({}.{})", ty.0, sim_field.0))?;
         let slot = self.store.add_track(ty, sim_field, default);
@@ -250,7 +254,7 @@ impl RenderRuntime {
 
     /// 开启某类型的 render 自管死亡淡出：sim 写死后，render 不即时回收行，而是在
     /// `duration` 秒内把 `fade_field` 权重由 1 推到 0（按真实 dt 积分，非帧数——动态
-    /// 帧率下淡出时长稳定），到 0 才真正回收。淡出期内实体仍存活于 render（`alive`
+    /// 帧率下淡出时长稳定），到 0 才真正回收。淡出期内实体仍在场于 render（`is_present`
     /// 为真、进提交、`continuous` 继续 tick——死亡动画照播）。
     ///
     /// `fade_field` 由淡出机制独占写（走 D1 登记，冲突即错），其 schema 默认值应为
@@ -261,8 +265,8 @@ impl RenderRuntime {
         fade_field: RFieldId,
         duration: f64,
     ) -> Result<(), String> {
-        if duration <= 0.0 {
-            return Err(format!("死亡淡出时长须 >0（给 {duration}）"));
+        if !duration.is_finite() || duration <= 0.0 {
+            return Err(format!("死亡淡出时长须为有限正数（给 {duration}）"));
         }
         if self.death_fade.contains_key(&ty) {
             return Err(format!("类型 {} 已设死亡淡出", ty.0));
@@ -355,9 +359,14 @@ impl RenderRuntime {
                 if tr.ty != inst.ty {
                     continue;
                 }
-                if let Some((prev, cur)) = self.store.track_pair(inst, tr.slot) {
+                if self.store.track_pair(inst, tr.slot).is_some() {
+                    let default = self
+                        .sim_defaults
+                        .get(&(tr.ty, tr.sim_field))
+                        .cloned()
+                        .unwrap_or(Value::Null);
                     self.store
-                        .write_render(inst, tr.out, tr.kind.sample(&prev, &cur, 1.0));
+                        .write_render(inst, tr.out, tr.kind.out_default(&default));
                 }
             }
         }
@@ -383,9 +392,14 @@ impl RenderRuntime {
                 let just_born = births.contains(&d.inst);
                 for &ti in tis {
                     let slot = self.tracks[ti].slot;
-                    self.store
-                        .apply_delta(d.inst, slot, d.old.clone(), d.new.clone(), just_born);
-                    if new_set.insert((d.inst, ti)) {
+                    let applied = self.store.apply_delta(
+                        d.inst,
+                        slot,
+                        d.old.clone(),
+                        d.new.clone(),
+                        just_born,
+                    );
+                    if applied && new_set.insert((d.inst, ti)) {
                         new_active.push((d.inst, ti));
                     }
                 }
@@ -438,7 +452,7 @@ impl RenderRuntime {
     }
 
     fn push_dying(&mut self, inst: InstanceId, duration: f64) {
-        if !self.store.alive(inst) {
+        if !self.store.is_present(inst) {
             return;
         }
         if let Some((_, remaining)) = self.dying.iter_mut().find(|(d, _)| *d == inst) {
@@ -459,7 +473,7 @@ impl RenderRuntime {
         let mut still = Vec::with_capacity(dying.len());
         let mut reclaimed = vec![];
         for (inst, remaining) in dying {
-            if !self.store.alive(inst) {
+            if !self.store.is_present(inst) {
                 continue;
             }
             let remaining = remaining - dt;
@@ -517,6 +531,7 @@ impl RenderRuntime {
 
     fn run_reactions(&mut self, sf: &SimFrame) {
         let detect = self.detect;
+        let deaths: HashSet<InstanceId> = sf.deaths.iter().copied().collect();
         for ri in 0..self.reactions.len() {
             let ty = self.reactions[ri].ty;
             let sim_field = self.reactions[ri].sim_field;
@@ -528,6 +543,9 @@ impl RenderRuntime {
             let mut eval_stack: Vec<Value> = vec![];
             let mut hits: Vec<(InstanceId, Vec<Value>)> = vec![];
             for rec in &sf.events {
+                if deaths.contains(&rec.inst) {
+                    continue;
+                }
                 if rec.inst.ty == ty
                     && rec.field == sim_field
                     && self.reactions[ri]
@@ -548,7 +566,7 @@ impl RenderRuntime {
                     groups.get_mut(&inst).unwrap().push(row);
                 }
                 for inst in order {
-                    if !self.store.alive(inst) {
+                    if !self.store.is_present(inst) {
                         continue;
                     }
                     let rows = groups.remove(&inst).unwrap();
@@ -566,7 +584,7 @@ impl RenderRuntime {
                 }
             } else {
                 for (inst, row) in hits {
-                    if !self.store.alive(inst) {
+                    if !self.store.is_present(inst) {
                         continue;
                     }
                     let writes = {
@@ -592,16 +610,14 @@ impl RenderRuntime {
         self.store.read_render(inst, f)
     }
 
-    pub fn alive(&self, inst: InstanceId) -> bool {
-        self.store.alive(inst)
+    /// 该实例在 render 侧是否在场。语义 ≠ sim `_alive`：死亡淡出窗口内仍在场
+    /// （render 自管寿命未回收），故 render「在场」= sim 存活 ⊔ 淡出尸体。
+    pub fn is_present(&self, inst: InstanceId) -> bool {
+        self.store.is_present(inst)
     }
 
     pub fn clock(&self) -> RenderClock {
         self.clock
-    }
-
-    pub fn store(&self) -> &RenderStore {
-        &self.store
     }
 
     /// 已摄入的最新 sim 帧号（检视握手进度）。

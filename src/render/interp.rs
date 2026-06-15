@@ -31,6 +31,22 @@ pub enum Interp {
 }
 
 impl Interp {
+    /// 该插值种类的输出字段**定型默认值**——与 [`Interp::sample`] 的产出类型一致，
+    /// 用作 `track` 输出 render 字段（[`super::store::RFieldId`]）的列定型种子。
+    ///
+    /// 这是把去装箱收益落到 render 最热的每帧 transform 插值输出上的关键：种子带类型，
+    /// 列即按输出类型无装箱定型（`Vec3Lerp`→Vec3 列、`Slerp`→Quat 列、`Lerp`→Float 列），
+    /// 而非旧版恒传 `Null`→Boxed 装箱列丢掉去装箱。`Snap`/`Step` 透传被镜像值（输出与源
+    /// 同型），故取 sim 字段默认值；量纲错配（如 `Slerp` 的源非 Quat）退到该种类的零元。
+    pub fn out_default(self, sim_default: &Value) -> Value {
+        match self {
+            Interp::Snap | Interp::Step => sim_default.clone(),
+            Interp::Lerp => Value::Float(sim_default.as_f64().unwrap_or(0.0)),
+            Interp::Vec3Lerp => Value::Vec3(sim_default.as_vec3().unwrap_or([0.0; 3])),
+            Interp::Slerp => Value::Quat(sim_default.as_quat().unwrap_or([0.0, 0.0, 0.0, 1.0])),
+        }
+    }
+
     /// 按 alpha 在 (prev, cur) 上求值。量纲错配一律退化为 `Snap`（取 cur）。
     pub fn sample(self, prev: &Value, cur: &Value, alpha: f64) -> Value {
         let alpha = if alpha.is_finite() {
@@ -130,7 +146,7 @@ pub struct Track {
     pub sim_field: crate::entity::FieldId,
     /// 插值结果写入的 render 字段（render 命名空间）。
     pub out: super::store::RFieldId,
-    /// 该字段在 [`super::store::RenderStore`] 中的局部 track 槽位（prev/cur 列下标）。
+    /// 该字段在 render sidecar 存储中的局部 track 槽位（prev/cur 列下标）。
     pub slot: usize,
     pub kind: Interp,
 }

@@ -3,13 +3,18 @@
 //! 买单约束：schema 注册期定型 + 交付是值快照 + ref 是 id 非指针——
 //! 没有任何指针逃逸到用户侧，runtime 拥有布局主权。cell 本来就是列单元。
 //!
-//! ## 类型化去装箱列（白送优化）
-//! 列不再是 `Vec<Value>`（每格一个 24+ 字节装箱枚举），而是按字段 schema 默认值
-//! 定型的[类型化无装箱列][`Column`]：`Bool→Vec<bool>`、`Int→Vec<i64>`、
-//! `Float→Vec<f64>`，其余（Str/Ref/Map/Null）落 `Boxed`。收益无条件正（白送）：
-//! 列扫描密度 ×3~×8、无逐格堆指针、快照即连续 memcpy（见 [`super::Snapshot`]）。
-//! 诚实条款：若某格写入与列类型不符（如向 Int 列写 Float/Null），该列**去优化**
-//! 为 `Boxed`（一次性、保精确往返），正确性永不受损。
+//! ## 两层共享底座（白送优化）
+//! 一个 SoA 存储分两层正交关注点，均抽到共享模块、sim 与 render sidecar 同一底座
+//! （收益两侧通吃）：
+//! - **数据**：列不再是 `Vec<Value>`（每格一个 24+ 字节装箱枚举），而是按字段 schema
+//!   默认值定型的[类型化无装箱列][`Column`]（[`crate::column`]）。密度 ×3~×8、无逐格
+//!   堆指针、快照即连续 memcpy（见 [`super::Snapshot`]）。
+//! - **代际 / 存活**：每行的代际号 + 存活位走共享 [`GenSlots`]（[`crate::genslots`]）。
+//!
+//! 本模块只在这两层之上叠 sim 自己的**行 / 存活内核**——决定「一行代表谁」的身份机：
+//! 代际 `id_slot` 间接（id→row）+ [`RowPolicy`] 压缩 / 留洞 + `row_id` 反查 + 空闲表。
+//! 该身份机与 render 的（`row = sim id` 直址）天差地别，故不共享（不抽 trait）；两者只
+//! 透过 `Column` / `GenSlots` 的槽寻址 API 触碰底座。
 //!
 //! 行身份策略（C6，开发者每 type 二选一）：
 //! - [`RowPolicy::Stable`]：零间接重映射、死亡留洞（洞可复用），行号终生不变；
@@ -19,139 +24,10 @@
 //! 诚实条款：id 复用 + 代际号意味着每次访问至少一次间接（id→row）与一次
 //! 代际比较——这是「无指针」的固定税，两种策略都付。
 
+use crate::column::Column;
 use crate::entity::{EntityTypeId, FIELD_ALIVE, FieldDef, FieldId, InstanceId};
+use crate::genslots::GenSlots;
 use crate::value::Value;
-
-/// 类型化无装箱列。列类型由字段 schema 默认值在注册期定型；类型不符的写入
-/// 触发一次性[去优化][`Column::boxify`]到 `Boxed`（保精确往返）。
-#[derive(Debug, Clone)]
-pub(crate) enum Column {
-    Bool(Vec<bool>),
-    Int(Vec<i64>),
-    Float(Vec<f64>),
-    /// 三维向量列（平移 / 缩放 / 轴）。内联 `[f64;3]` SoA——transform 是 render
-    /// 最热、最频扫的数据，去装箱密度收益在此最大。
-    Vec3(Vec<[f64; 3]>),
-    /// 四元数列（方向）。内联 `[f64;4]` SoA。
-    Quat(Vec<[f64; 4]>),
-    /// 装箱回退：异构 / Str / Ref / Map / Null 类型字段。
-    Boxed(Vec<Value>),
-}
-
-impl Column {
-    /// 按字段默认值定型并填充 `n` 行。Bool/Int/Float 走无装箱列，其余落 Boxed。
-    fn with_default(default: &Value, n: usize) -> Column {
-        match default {
-            Value::Bool(b) => Column::Bool(vec![*b; n]),
-            Value::Int(i) => Column::Int(vec![*i; n]),
-            Value::Float(f) => Column::Float(vec![*f; n]),
-            Value::Vec3(a) => Column::Vec3(vec![*a; n]),
-            Value::Quat(a) => Column::Quat(vec![*a; n]),
-            other => Column::Boxed(vec![other.clone(); n]),
-        }
-    }
-
-    /// 读一格（重建 [`Value`]）。OOB → Null（防御，正常路径行号已由 row_of 校验）。
-    fn get(&self, row: usize) -> Value {
-        match self {
-            Column::Bool(c) => c.get(row).map_or(Value::Null, |&b| Value::Bool(b)),
-            Column::Int(c) => c.get(row).map_or(Value::Null, |&i| Value::Int(i)),
-            Column::Float(c) => c.get(row).map_or(Value::Null, |&f| Value::Float(f)),
-            Column::Vec3(c) => c.get(row).map_or(Value::Null, |&a| Value::Vec3(a)),
-            Column::Quat(c) => c.get(row).map_or(Value::Null, |&a| Value::Quat(a)),
-            Column::Boxed(c) => c.get(row).cloned().unwrap_or(Value::Null),
-        }
-    }
-
-    /// 写一格。值与列类型不符 → 去优化为 Boxed 再写（一次性，正确性优先）。
-    fn set(&mut self, row: usize, v: Value) {
-        match (&mut *self, &v) {
-            (Column::Bool(c), Value::Bool(b)) => c[row] = *b,
-            (Column::Int(c), Value::Int(i)) => c[row] = *i,
-            (Column::Float(c), Value::Float(f)) => c[row] = *f,
-            (Column::Vec3(c), Value::Vec3(a)) => c[row] = *a,
-            (Column::Quat(c), Value::Quat(a)) => c[row] = *a,
-            (Column::Boxed(c), _) => c[row] = v,
-            _ => {
-                self.boxify();
-                if let Column::Boxed(c) = self {
-                    c[row] = v;
-                }
-            }
-        }
-    }
-
-    /// 追加一行。
-    fn push(&mut self, v: Value) {
-        match (&mut *self, &v) {
-            (Column::Bool(c), Value::Bool(b)) => c.push(*b),
-            (Column::Int(c), Value::Int(i)) => c.push(*i),
-            (Column::Float(c), Value::Float(f)) => c.push(*f),
-            (Column::Vec3(c), Value::Vec3(a)) => c.push(*a),
-            (Column::Quat(c), Value::Quat(a)) => c.push(*a),
-            (Column::Boxed(c), _) => c.push(v),
-            _ => {
-                self.boxify();
-                if let Column::Boxed(c) = self {
-                    c.push(v);
-                }
-            }
-        }
-    }
-
-    fn swap_remove(&mut self, row: usize) {
-        match self {
-            Column::Bool(c) => {
-                c.swap_remove(row);
-            }
-            Column::Int(c) => {
-                c.swap_remove(row);
-            }
-            Column::Float(c) => {
-                c.swap_remove(row);
-            }
-            Column::Vec3(c) => {
-                c.swap_remove(row);
-            }
-            Column::Quat(c) => {
-                c.swap_remove(row);
-            }
-            Column::Boxed(c) => {
-                c.swap_remove(row);
-            }
-        }
-    }
-
-    /// Stable 死亡留洞：仅 Boxed 需要落 Null 以释放堆（Str/Map）；无装箱列的死格
-    /// 不可达（row_of 拒绝），无需清。
-    fn clear_row(&mut self, row: usize) {
-        if let Column::Boxed(c) = self {
-            c[row] = Value::Null;
-        }
-    }
-
-    /// `_alive` / 其他 Bool 列的稠密位扫描入口（白送优化「ECS 快路 / type 扇出」
-    /// 顺序列访问）。非 Bool（已去优化）返回 None，调用方回退逐格 get。
-    fn as_bool_slice(&self) -> Option<&[bool]> {
-        match self {
-            Column::Bool(c) => Some(c),
-            _ => None,
-        }
-    }
-
-    /// 去优化：把当前类型化列原样物化为 Boxed（保精确往返）。
-    fn boxify(&mut self) {
-        let boxed = match self {
-            Column::Bool(c) => c.iter().map(|&b| Value::Bool(b)).collect(),
-            Column::Int(c) => c.iter().map(|&i| Value::Int(i)).collect(),
-            Column::Float(c) => c.iter().map(|&f| Value::Float(f)).collect(),
-            Column::Vec3(c) => c.iter().map(|&a| Value::Vec3(a)).collect(),
-            Column::Quat(c) => c.iter().map(|&a| Value::Quat(a)).collect(),
-            Column::Boxed(_) => return,
-        };
-        *self = Column::Boxed(boxed);
-    }
-}
 
 /// 行身份策略（C6）。每 entity 类型注册期二选一，可由遥测（profiler）建议，
 /// 但最终由开发者 pin。
@@ -170,7 +46,7 @@ const NO_ROW: u32 = u32::MAX;
 #[derive(Clone, Copy)]
 struct IdSlot {
     /// 当前（或下一任）住户的代际号。释放时 +1 防 ABA。
-    generation: u32,
+    generation: u64,
     /// id → 行号间接（固定税）。NO_ROW = 空置。
     row: u32,
 }
@@ -187,11 +63,11 @@ pub(crate) struct TypeStore {
     /// SoA：cols[field] 是类型化无装箱列。同字段连续存放——type scope 扇出 /
     /// ECS 快路是顺序列扫描，路由产物即访问 schedule（「完美预取」的结构前提）。
     cols: Vec<Column>,
-    /// row → id / 代际（迭代时反向构造 InstanceId，无需回查 sparse 表）。
+    /// row → id（迭代时反向构造 InstanceId 的 id 部分，无需回查 sparse 表）。
     row_id: Vec<u32>,
-    row_gen: Vec<u32>,
-    /// Stable 策略的洞标记；Compact 下恒 true。
-    row_live: Vec<bool>,
+    /// 每行的代际号 + 存活位（共享行 / 存活底座）。代际供反向构造 InstanceId；存活位
+    /// 是 Stable 策略的洞标记（Compact 下恒 true，行恒稠密）。与 `row_id` 平行同长。
+    slots: GenSlots,
     id_slot: Vec<IdSlot>,
     free_ids: Vec<u32>,
     /// Stable 策略可复用的洞。
@@ -236,8 +112,7 @@ impl Store {
             policy,
             cols,
             row_id: vec![],
-            row_gen: vec![],
-            row_live: vec![],
+            slots: GenSlots::new(),
             id_slot: vec![],
             free_ids: vec![],
             free_rows: vec![],
@@ -302,11 +177,11 @@ impl Store {
         match t.cols[FIELD_ALIVE.0 as usize].as_bool_slice() {
             Some(alive) => {
                 for r in 0..t.row_id.len() {
-                    if t.row_live[r] && alive[r] {
+                    if t.slots.is_live(r) && alive[r] {
                         f(InstanceId {
                             ty,
                             id: t.row_id[r],
-                            generation: t.row_gen[r],
+                            generation: t.slots.generation(r),
                         });
                     }
                 }
@@ -314,11 +189,11 @@ impl Store {
             None => {
                 let col = &t.cols[FIELD_ALIVE.0 as usize];
                 for r in 0..t.row_id.len() {
-                    if t.row_live[r] && matches!(col.get(r), Value::Bool(true)) {
+                    if t.slots.is_live(r) && matches!(col.get(r), Value::Bool(true)) {
                         f(InstanceId {
                             ty,
                             id: t.row_id[r],
-                            generation: t.row_gen[r],
+                            generation: t.slots.generation(r),
                         });
                     }
                 }
@@ -364,8 +239,7 @@ impl Store {
                     col.set(r, t.fields[ci].default.clone());
                 }
                 t.row_id[r] = id;
-                t.row_gen[r] = generation;
-                t.row_live[r] = true;
+                t.slots.activate(r, generation);
                 r as u32
             }
             None => {
@@ -373,9 +247,7 @@ impl Store {
                     col.push(t.fields[ci].default.clone());
                 }
                 t.row_id.push(id);
-                t.row_gen.push(generation);
-                t.row_live.push(true);
-                (t.row_id.len() - 1) as u32
+                t.slots.push_live(generation) as u32
             }
         };
         t.id_slot[id as usize].row = row;
@@ -391,7 +263,10 @@ impl Store {
         };
         let t = &mut self.types[ti];
         t.id_slot[inst.id as usize] = IdSlot {
-            generation: inst.generation + 1,
+            generation: inst
+                .generation
+                .checked_add(1)
+                .expect("InstanceId generation exhausted"),
             row: NO_ROW,
         };
         t.free_ids.push(inst.id);
@@ -401,7 +276,7 @@ impl Store {
                 for col in &mut t.cols {
                     col.clear_row(r);
                 }
-                t.row_live[r] = false;
+                t.slots.kill(r);
                 t.free_rows.push(r as u32);
             }
             RowPolicy::Compact => {
@@ -411,8 +286,7 @@ impl Store {
                     col.swap_remove(r);
                 }
                 t.row_id.swap_remove(r);
-                t.row_gen.swap_remove(r);
-                t.row_live.swap_remove(r);
+                t.slots.swap_remove(r);
                 if r != last {
                     let moved_id = t.row_id[r] as usize;
                     t.id_slot[moved_id].row = r as u32;

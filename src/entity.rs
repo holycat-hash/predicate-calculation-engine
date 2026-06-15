@@ -18,7 +18,7 @@ pub struct FieldId(pub u32);
 pub struct InstanceId {
     pub ty: EntityTypeId,
     pub id: u32,
-    pub(crate) generation: u32,
+    pub(crate) generation: u64,
 }
 
 /// cell 地址：(type, id, field)。写入、订阅、路由的最小粒度。
@@ -38,11 +38,19 @@ pub struct FieldDef {
 
 impl FieldDef {
     pub fn new(name: &str, default: Value) -> Self {
-        FieldDef { name: name.to_string(), is_ref: false, default }
+        FieldDef {
+            name: name.to_string(),
+            is_ref: false,
+            default,
+        }
     }
 
     pub fn reference(name: &str) -> Self {
-        FieldDef { name: name.to_string(), is_ref: true, default: Value::Null }
+        FieldDef {
+            name: name.to_string(),
+            is_ref: true,
+            default: Value::Null,
+        }
     }
 }
 
@@ -50,7 +58,7 @@ impl FieldDef {
 #[derive(Debug, Clone)]
 pub struct EntityType {
     pub name: String,
-    /// fields[0] 恒为内建 `_alive`（runtime 注册时自动注入）。
+    /// `fields[0]` 恒为内建 `_alive`（runtime 注册时自动注入）。
     pub fields: Vec<FieldDef>,
     /// singleton 类型恒有且只有实例 0。
     pub singleton: bool,

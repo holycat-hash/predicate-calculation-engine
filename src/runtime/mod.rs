@@ -15,8 +15,8 @@
 //! ```
 //!
 //! ## 白送优化（A 层，已落地）
-//! SoA 列存（[`store`]）；单存储 + 写日志双缓冲；值桶 / 共享排序阈值表 /
-//! crossed 区间查询（[`route`]）；等价条件合并求值；fold 增量维护（min/max
+//! SoA 列存（`store`）；单存储 + 写日志双缓冲；值桶 / 共享排序阈值表 /
+//! crossed 区间查询（`route`）；等价条件合并求值；fold 增量维护（min/max
 //! 多重集）；Clock 谓词退化为 ECS 稠密遍历（注册期识别）；帧 scratch 缓冲
 //! 跨帧复用；免费 profiler（[`Profile`]，D2 送的遥测）。
 //! 执行阶段零序约束 + 无原子：写从不落共享存储，落本地写缓冲，提交在帧界
@@ -24,15 +24,15 @@
 //!
 //! ## 开发者档位（C 层）
 //! C1 [`Tier`]、C2 [`CalcOptions::reads`]、C3 [`Residency`]、
-//! C4 [`Determinism`]、C5 [`Detect`]、C6 [`store::RowPolicy`]。
+//! C4 [`Determinism`]、C5 [`Detect`]、C6 [`RowPolicy`]。
 
 pub mod clock;
 mod route;
 mod store;
 
-pub use store::{RowPolicy, Store};
 /// render 复用 sim 的谓词求值器 / 投影（条件评估单一真源，render 不再 fork）。
-pub(crate) use route::{project_ro, CompiledCond};
+pub(crate) use route::{CompiledCond, project_ro};
+pub use store::{RowPolicy, Store};
 
 use std::collections::{HashMap, HashSet};
 
@@ -261,7 +261,7 @@ pub(crate) struct Trigger {
 
 /// 全存快照（GGPO 式 rollback netcode 的接口，C 层「有代价」优化）。
 ///
-/// 捕获全部**动态**仿真状态：[`Store`]（类型化无装箱列 → 整存克隆退化为连续
+/// 捕获全部**动态**仿真状态：`Store`（类型化无装箱列 → 整存克隆退化为连续
 /// memcpy，这正是「廉价」的物理来源）、fold 增量、ref 反向表、clock 闹钟、待路由
 /// 写集、spawn 队列、帧号。注册期**静态**物——谓词索引、calc 闭包、C 档位配置、
 /// 免费 profiler 遥测——不入快照（rollback 不改注册，遥测是单调诊断量）。
@@ -395,7 +395,7 @@ impl Runtime {
     }
 
     /// 本帧路由的写集（= §0 唯一触发源）。render 的摄入源：与 sim 谓词所见同一流，
-    /// 故 render 是写流的又一消费者，含外部 spawn 的出生写。须先 [`enable_render_feed`]。
+    /// 故 render 是写流的又一消费者，含外部 spawn 的出生写。须先 [`Runtime::enable_render_feed`]。
     pub fn committed_writes(&self) -> &[WriteRec] {
         &self.last_routed
     }

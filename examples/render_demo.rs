@@ -25,7 +25,11 @@ fn main() {
         ],
         false,
     );
-    let (f_pos, f_vel, f_hp) = (rt.field(unit, "pos"), rt.field(unit, "vel"), rt.field(unit, "hp"));
+    let (f_pos, f_vel, f_hp) = (
+        rt.field(unit, "pos"),
+        rt.field(unit, "vel"),
+        rt.field(unit, "hp"),
+    );
     let (cty, cframe) = {
         let c = rt.clock();
         (c.ty, c.f_frame)
@@ -73,11 +77,14 @@ fn main() {
     // ---- 帧循环：每个 sim 帧后，render 在该区间内画 3 个动态帧（alpha 0/0.33/0.66）----
     for sim_frame in 1..=4u64 {
         rt.step();
-        publisher.publish(&rt, sim_frame);
+        publisher.publish(&rt);
         for sf in publisher.drain() {
             rr.ingest(&sf);
         }
-        println!("sim 帧 {sim_frame}：sim.pos = {:?}（render 落后一帧做插值）", rt.read(u, f_pos));
+        println!(
+            "sim 帧 {sim_frame}：sim.pos = {:?}（render 落后一帧做插值）",
+            rt.read(u, f_pos)
+        );
         for k in 0..3 {
             let alpha = k as f64 / 3.0;
             rr.render_frame(0.016, alpha);
@@ -93,7 +100,7 @@ fn main() {
     println!("\n-- 外部把 hp 砍到 0 --");
     rt.debug_write(u, f_hp, Value::Int(0));
     rt.step();
-    publisher.publish(&rt, 5);
+    publisher.publish(&rt);
     for sf in publisher.drain() {
         rr.ingest(&sf);
     }

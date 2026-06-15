@@ -1,4 +1,4 @@
-//! 演示：render 的「良好渲染语义数据」全流程 → GPU 提交 staging 包。
+﻿//! 演示：render 的「良好渲染语义数据」全流程 → GPU 提交 staging 包。
 //!
 //! 固定步长 sim 每帧推进 Unit 的位置（+10 像素）与朝向（+30°）；动态帧率 render：
 //! - `track` 把 pos（Vec3Lerp）/ rot（Slerp）/ mesh·mat（Snap）镜像并按 alpha 插值；
@@ -119,7 +119,7 @@ fn main() {
             rt.debug_write(u, f_action, Value::Int(4)); // 第 2 帧切动作 → 动画态切换
         }
         rt.step();
-        publisher.publish(&rt, sim_frame);
+        publisher.publish(&rt);
         for sf in publisher.drain() {
             rr.ingest(&sf);
         }
@@ -134,7 +134,7 @@ fn main() {
     println!("\n== 死亡淡出（render 接管寿命，延迟回收）==");
     rt.destroy(u);
     rt.step();
-    publisher.publish(&rt, 4);
+    publisher.publish(&rt);
     for sf in publisher.drain() {
         rr.ingest(&sf);
     }
@@ -148,8 +148,8 @@ fn main() {
                 rr.dying_count()
             ),
             None => println!(
-                "  淡出帧 {frame}: 已淡尽回收，提交为空（alive={}）",
-                rr.alive(u)
+                "  淡出帧 {frame}: 已淡尽回收，提交为空（present={}）",
+                rr.is_present(u)
             ),
         }
     }

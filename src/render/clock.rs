@@ -19,7 +19,7 @@ pub struct RenderClock {
     pub frame: u64,
     /// 本 render 帧经过秒数（动态帧率：每帧不同）。
     pub dt: f64,
-    /// 插值因子 ∈ [0,1]：当前 render 帧在 (上一 sim 帧, 当前 sim 帧) 之间的位置。
+    /// 插值因子 ∈ `[0,1]`：当前 render 帧在 (上一 sim 帧, 当前 sim 帧) 之间的位置。
     pub alpha: f64,
 }
 
@@ -32,7 +32,7 @@ impl RenderClock {
         }
     }
 
-    /// 宿主循环每 render 帧调用：推进帧号、记录 dt、钳定 alpha 到 [0,1]
+    /// 宿主循环每 render 帧调用：推进帧号、记录 dt、钳定 alpha 到 `[0,1]`
     /// （越界即外推区，本版钳到端点——平顺优先，不过冲，Cr2）。
     pub fn begin_frame(&mut self, dt: f64, alpha: f64) {
         self.frame += 1;

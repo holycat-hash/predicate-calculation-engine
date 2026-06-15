@@ -5,8 +5,8 @@
 //! 动态帧率（dt/alpha 可变）、出生 snap（不从默认值滑入）、并发双线程握手
 //! （Publisher 三缓冲，无数据竞争）。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pce::predicate::type_scope;
 use pce::{
@@ -25,7 +25,10 @@ fn sim_with_mover(vel: i64) -> (Runtime, pce::EntityTypeId, pce::FieldId, pce::F
     let mut rt = Runtime::new();
     let unit = rt.register_entity_type(
         "Unit",
-        vec![FieldDef::new("pos", Value::Int(0)), FieldDef::new("vel", Value::Int(vel))],
+        vec![
+            FieldDef::new("pos", Value::Int(0)),
+            FieldDef::new("vel", Value::Int(vel)),
+        ],
         false,
     );
     let f_pos = rt.field(unit, "pos");
@@ -62,18 +65,22 @@ fn lerp_interpolates_between_sim_frames_across_alpha() {
 
     // sim 帧 1：出生 + mover 首次推进（store.pos 0→10，但本帧路由集是出生写）。
     rt.step();
-    publisher.publish(&rt, 1);
-    rr.sync(&publisher,0.016, 0.0);
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 0.0);
     assert_eq!(rr.read(u, r_pos), Value::Float(0.0), "出生帧 snap 到初值 0");
 
     // sim 帧 2：路由集 = [pos 0→10]。render 在该区间插值 0→10。
     rt.step();
-    publisher.publish(&rt, 2);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
     rr.render_frame(0.016, 0.0);
     assert_eq!(rr.read(u, r_pos), Value::Float(0.0), "alpha=0 → prev");
     rr.render_frame(0.016, 0.25);
-    assert_eq!(rr.read(u, r_pos), Value::Float(2.5), "alpha=0.25 → 1/4 路程");
+    assert_eq!(
+        rr.read(u, r_pos),
+        Value::Float(2.5),
+        "alpha=0.25 → 1/4 路程"
+    );
     rr.render_frame(0.016, 0.5);
     assert_eq!(rr.read(u, r_pos), Value::Float(5.0), "alpha=0.5 → 半程");
     rr.render_frame(0.016, 1.0);
@@ -81,7 +88,7 @@ fn lerp_interpolates_between_sim_frames_across_alpha() {
 
     // sim 帧 3：路由集 = [pos 10→20]。换区间，插值 10→20。
     rt.step();
-    publisher.publish(&rt, 3);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
     rr.render_frame(0.016, 0.5);
     assert_eq!(rr.read(u, r_pos), Value::Float(15.0), "下一区间半程 = 15");
@@ -96,10 +103,10 @@ fn snap_kind_ignores_alpha_takes_current() {
 
     let u = rt.spawn(unit, vec![(f_pos, Value::Int(0))]);
     rt.step();
-    publisher.publish(&rt, 1);
-    rr.sync(&publisher,0.016, 0.0);
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 0.0);
     rt.step();
-    publisher.publish(&rt, 2);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
     // Snap：无视 alpha，恒取 cur=10。
     rr.render_frame(0.016, 0.0);
@@ -122,15 +129,15 @@ fn static_entity_leaves_active_set_and_holds_value() {
 
     let u = rt.spawn(unit, vec![(f_pos, Value::Int(42))]);
     rt.step(); // 出生帧
-    publisher.publish(&rt, 1);
-    rr.sync(&publisher,0.016, 1.0);
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 1.0);
     assert_eq!(rr.read(u, r_pos), Value::Float(42.0), "出生 snap 到 42");
     assert_eq!(rr.active_count(), 1, "出生区间内仍活动");
 
     // 后续帧无 pos 写入：活动集结算清空，输出稳定保持 42（不再每帧重算）。
-    for f in 2..=6 {
+    for _ in 2..=6 {
         rt.step();
-        publisher.publish(&rt, f);
+        publisher.publish(&rt);
         pump(&mut rr, &publisher);
         for a in [0.0, 0.3, 0.7, 1.0] {
             rr.render_frame(0.016, a);
@@ -155,7 +162,10 @@ fn reaction_fires_on_sim_event_became_and_crossed() {
         "death_fx",
         unit,
         f_hp,
-        Cond::Crossed(pce::Expr::Val(pce::ValRef::Const(Value::Int(1))), pce::Dir::Down),
+        Cond::Crossed(
+            pce::Expr::Val(pce::ValRef::Const(Value::Int(1))),
+            pce::Dir::Down,
+        ),
         vec![Proj::New(vec![]), Proj::Old(vec![])],
         false,
         &[r_fx],
@@ -171,16 +181,62 @@ fn reaction_fires_on_sim_event_became_and_crossed() {
 
     let u = rt.spawn(unit, vec![(f_hp, Value::Int(30))]);
     rt.step();
-    publisher.publish(&rt, 1);
-    rr.sync(&publisher,0.016, 1.0);
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 1.0);
     assert_eq!(rr.read(u, r_fx), Value::Int(0), "未掉血，无死亡特效");
 
     // 外部把 hp 砍到 0（跌穿阈值 1，向下）。
     rt.debug_write(u, f_hp, Value::Int(0));
     rt.step();
-    publisher.publish(&rt, 2);
-    rr.sync(&publisher,0.016, 1.0);
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 1.0);
     assert_eq!(rr.read(u, r_fx), Value::Int(1), "hp 跌穿 0 → 死亡特效起");
+}
+
+#[test]
+fn reaction_skips_writer_that_dies_in_same_sim_frame() {
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![FieldDef::new("hp", Value::Int(30))], false);
+    let f_hp = rt.field(unit, "hp");
+    rt.enable_render_feed();
+
+    let mut rr = RenderRuntime::new(&rt);
+    let r_hit = rr.add_render_field(unit, Value::Int(0));
+    let r_fade = rr.add_render_field(unit, Value::Float(1.0));
+    rr.set_death_fade(unit, r_fade, 1.0).unwrap();
+    rr.reaction(
+        "hit_fx",
+        unit,
+        f_hp,
+        Cond::Changed,
+        vec![],
+        false,
+        &[r_hit],
+        Box::new(move |ctx, _| ctx.write(r_hit, 1)),
+    )
+    .unwrap();
+    let publisher = Publisher::new(rr.tracked_fields());
+
+    let u = rt.spawn(unit, vec![(f_hp, Value::Int(30))]);
+    rt.step();
+    publisher.publish(&rt);
+    pump(&mut rr, &publisher);
+
+    rt.debug_write(u, f_hp, Value::Int(0));
+    rt.destroy(u);
+    rt.step();
+    publisher.publish(&rt);
+    pump(&mut rr, &publisher);
+
+    assert!(
+        rr.is_present(u),
+        "死亡淡出保留 render 行，便于观察 reaction 是否误写"
+    );
+    assert_eq!(
+        rr.read(u, r_hit),
+        Value::Int(0),
+        "同帧死亡 writer 与 sim route 一致：不触发 writer-self render reaction"
+    );
 }
 
 #[test]
@@ -206,7 +262,7 @@ fn continuous_calc_accumulates_with_dt() {
 
     let u = rt.spawn(unit, vec![]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
 
     // 变帧率：dt 每帧不同，timer 累加真实经过时间。
@@ -217,7 +273,10 @@ fn continuous_calc_accumulates_with_dt() {
         expect += dt;
     }
     let got = rr.read(u, r_timer).as_f64().unwrap();
-    assert!((got - expect).abs() < 1e-9, "timer 累加变 dt：{got} vs {expect}");
+    assert!(
+        (got - expect).abs() < 1e-9,
+        "timer 累加变 dt：{got} vs {expect}"
+    );
 }
 
 #[test]
@@ -236,9 +295,9 @@ fn concurrent_two_thread_handoff_no_data_race() {
     let sim_pub = Arc::clone(&publisher);
     let sim_done = Arc::clone(&done);
     let sim = std::thread::spawn(move || {
-        for f in 1..=FRAMES {
+        for _ in 1..=FRAMES {
             rt.step();
-            sim_pub.publish(&rt, f);
+            sim_pub.publish(&rt);
             std::thread::yield_now();
         }
         sim_done.store(true, Ordering::Release);
@@ -266,18 +325,21 @@ fn concurrent_two_thread_handoff_no_data_race() {
             rr.ingest(&sf);
         }
         rr.render_frame(0.016, 1.0);
-        (rr.last_ingested(), rr.read(u, r_pos), rr.alive(u))
+        (rr.last_ingested(), rr.read(u, r_pos), rr.is_present(u))
     });
 
     sim.join().unwrap();
-    let (ingested, final_pos, alive) = render.join().unwrap();
+    let (ingested, final_pos, present) = render.join().unwrap();
 
-    assert!(alive, "并发结束后实体在 render 侧仍存活");
+    assert!(present, "并发结束后实体在 render 侧仍在场");
     assert!(ingested >= 1, "render 至少摄入了一帧（握手生效）");
     // 最终帧 alpha=1 → cur。cur = 上一 sim 帧的 pos 推进值，必为 10 的整数倍且有限。
     let p = final_pos.as_f64().expect("插值输出为数值");
     assert!(p.is_finite() && p >= 0.0, "最终插值输出有限且非负：{p}");
-    assert!((p / 10.0).fract().abs() < 1e-9, "alpha=1 落在 sim 帧整点 {p}");
+    assert!(
+        (p / 10.0).fract().abs() < 1e-9,
+        "alpha=1 落在 sim 帧整点 {p}"
+    );
 }
 
 // ---- 审查发现的回归锁定 ----
@@ -294,15 +356,19 @@ fn multiple_tracks_on_same_field_all_update() {
 
     let u = rt.spawn(unit, vec![(f_pos, Value::Int(0))]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     rr.sync(&publisher, 0.016, 1.0);
     rt.step();
-    publisher.publish(&rt, 2);
+    publisher.publish(&rt);
     pump(&mut rr, &publisher);
     rr.render_frame(0.016, 0.5);
     // 区间 0→10：Lerp 半程 = 5，Snap = cur = 10。两个输出都活着。
     assert_eq!(rr.read(u, r_lerp), Value::Float(5.0), "Lerp 轨道更新");
-    assert_eq!(rr.read(u, r_snap), Value::Int(10), "Snap 轨道同样更新（不再被覆盖成 Null）");
+    assert_eq!(
+        rr.read(u, r_snap),
+        Value::Int(10),
+        "Snap 轨道同样更新（不再被覆盖成 Null）"
+    );
 }
 
 #[test]
@@ -312,7 +378,10 @@ fn birth_snaps_uninitialized_tracked_field_to_sim_default() {
     let mut rt = Runtime::new();
     let unit = rt.register_entity_type(
         "Unit",
-        vec![FieldDef::new("pos", Value::Int(0)), FieldDef::new("facing", Value::Int(7))],
+        vec![
+            FieldDef::new("pos", Value::Int(0)),
+            FieldDef::new("facing", Value::Int(7)),
+        ],
         false,
     );
     let f_facing = rt.field(unit, "facing");
@@ -325,9 +394,13 @@ fn birth_snaps_uninitialized_tracked_field_to_sim_default() {
     // 只初始化 pos，facing 取 schema 默认值 7（不产生写日志增量）。
     let u = rt.spawn(unit, vec![(rt.field(unit, "pos"), Value::Int(3))]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     rr.sync(&publisher, 0.016, 1.0);
-    assert_eq!(rr.read(u, r_facing), Value::Int(7), "出生 snap 到 sim 默认值 7，非 Null");
+    assert_eq!(
+        rr.read(u, r_facing),
+        Value::Int(7),
+        "出生 snap 到 sim 默认值 7，非 Null"
+    );
 }
 
 #[test]
@@ -345,16 +418,19 @@ fn render_slower_than_sim_drains_all_no_ghost() {
 
     let b = rt.spawn(unit, vec![(f_pos, Value::Int(0))]);
     rt.step();
-    publisher.publish(&rt, 1); // 出生 B（render 尚未消费）
+    publisher.publish(&rt); // 出生 B（render 尚未消费）
     rt.destroy(b);
     rt.step();
-    publisher.publish(&rt, 2); // B 死亡（render 仍未消费）
+    publisher.publish(&rt); // B 死亡（render 仍未消费）
     rt.step();
-    publisher.publish(&rt, 3); // 又一帧
+    publisher.publish(&rt); // 又一帧
 
     // render 现在一次性 drain 三帧，顺序摄入：出生 → 死亡 → 第三帧。
     pump(&mut rr, &publisher);
-    assert!(!rr.alive(b), "死亡帧未被跳过：B 在 render 侧已回收，无幽灵");
+    assert!(
+        !rr.is_present(b),
+        "死亡帧未被跳过：B 在 render 侧已回收，无幽灵"
+    );
 }
 
 #[test]
@@ -377,7 +453,10 @@ fn render_d1_collision_and_duplicate_writes_error() {
     let dupself = rr.continuous("c", unit, &[rg, rg], Box::new(|_| {}));
     assert!(dupself.is_err(), "片内重复声明应报错");
     // rg 既然注册失败，应仍可被后续合法注册者占有（无幽灵归属）。
-    assert!(rr.continuous("d", unit, &[rg], Box::new(|_| {})).is_ok(), "失败注册不留脏归属");
+    assert!(
+        rr.continuous("d", unit, &[rg], Box::new(|_| {})).is_ok(),
+        "失败注册不留脏归属"
+    );
 }
 
 #[test]
@@ -404,7 +483,7 @@ fn render_detect_strict_panics_on_conflicting_fold() {
     let publisher = Publisher::new(rr.tracked_fields());
     let _u = rt.spawn(unit, vec![]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     rr.sync(&publisher, 0.016, 0.5); // render_frame 跑 continuous → 折叠冲突 panic
 }
 
@@ -430,7 +509,7 @@ fn render_detect_silent_folds_last_wins() {
     let publisher = Publisher::new(rr.tracked_fields());
     let u = rt.spawn(unit, vec![]);
     rt.step();
-    publisher.publish(&rt, 1);
+    publisher.publish(&rt);
     rr.sync(&publisher, 0.016, 0.5);
     assert_eq!(rr.read(u, rf), Value::Int(2), "Silent 折叠为 last-wins=2");
 }

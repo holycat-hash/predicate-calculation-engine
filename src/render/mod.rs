@@ -22,11 +22,18 @@
 //! - [`RenderRuntime::continuous`]：render clock 每帧对每个在场实例运行（相机阻尼、
 //!   派生 transform）。
 //!
+//! ## 剔除 / LOD（Cr3，非第四注册概念）
+//! [`RenderRuntime::enable_culling`] + [`RenderRuntime::cull_type`] 把 render 自维护的
+//! [`SpatialGrid`] 接成 **§6.1「物化为索引实体」的 render 对偶**：相机每 render 帧查询
+//! 网格得**可见集**，`continuous` 与 `submit` 收窄到视域内（离屏不重算 / 不提交）。LOD
+//! 距离作为派生 render 字段暴露，分档由开发者持有（见 [`visible`]）。行为仍是三类注册，
+//! 剔除只是个索引 + 查询，未启用时与今日逐字相同。
+//!
 //! ## 成本（render 侧不变量）
-//! 每 render 帧：O(本 sim 区间在动 ∩ 存活) 的插值重算（A8 稀疏性经写日志延伸到
-//! 连续更新）+ O(存活) 的连续扫；`submit()` 作为终端读出按可渲染类型扫 live rows；
-//! 每 sim 帧：O(|事件|) 的反应路由。剔除/LOD
-//! （Cr3，§6.1 物化为可见集实体）进一步压低存活扫的 N，留作后续。
+//! 每 render 帧：O(本 sim 区间在动 ∩ 存活) 的插值重算（A8 稀疏性经写日志延伸到连续
+//! 更新）+ O(**可见**) 的连续扫与 `submit` 装配（启用剔除后存活扫的 N 被可见集收窄；
+//! 未启用则退化 O(存活) 全扫）；每 sim 帧：O(|事件|) 的反应路由 + O(position 写) 的网格
+//! 增量维护。
 
 pub mod clock;
 pub mod ctx;
@@ -34,6 +41,7 @@ pub mod handoff;
 pub mod interp;
 mod store;
 pub mod submission;
+pub mod visible;
 
 pub use clock::RenderClock;
 pub use ctx::{ContinuousFn, ReactionFn, RenderCtx, RenderInput};
@@ -41,12 +49,14 @@ pub use handoff::{Publisher, SimFrame, TrackedDelta};
 pub use interp::{Interp, Track};
 pub use store::RFieldId;
 pub use submission::{RenderBinding, RenderPacket, SubmissionView};
+pub use visible::{Axes, CullShape, lod_band};
 
 use std::collections::{HashMap, HashSet};
 
 use crate::entity::{EntityTypeId, FieldId, InstanceId};
 use crate::predicate::{Cond, Expr, Proj, ValRef};
 use crate::runtime::{CompiledCond, Detect, Runtime, project_ro};
+use crate::spatial::SpatialGrid;
 use crate::value::Value;
 
 use store::RenderStore;
@@ -71,6 +81,36 @@ struct Continuous {
     ty: EntityTypeId,
     writes: HashSet<RFieldId>,
     f: ContinuousFn,
+}
+
+/// 一个被 `cull_type` opt-in 的剔除类型的登记。
+#[derive(Clone, Copy)]
+struct CulledType {
+    /// 喂网格的 sim 平移字段（须已 `track`）。ingest 按 (ty, 此字段) 匹配增量喂入。
+    translation_field: FieldId,
+    /// 用于 render-frame 采样刷新网格的 track 槽位，确保剔除与提交 transform 同时刻。
+    track_slot: usize,
+    /// 可选：每帧把可见实体到相机距离写入此 render 字段（开发者据此分档 LOD）。
+    dist_field: Option<RFieldId>,
+}
+
+/// render 侧空间索引 / 可见集剔除 / LOD 状态（§6.1「物化为索引实体」的 render 对偶）。
+/// 全在一个 `Option` 里：`None` = 未启用剔除（行为与今日逐字相同）。
+struct Spatial {
+    /// render 私有网格（喂自 ingest 的 tracked position 增量；派生态，不入任何快照）。
+    grid: SpatialGrid,
+    /// 全局投影平面（Vec3 平移 → 网格 2D 平面）。相机与各剔除类型共用。
+    axes: Axes,
+    /// 相机实例 + 其位姿 render 字段（render-rate：由 track/continuous 维护）+ cull 形状。
+    camera: InstanceId,
+    cam_pos: RFieldId,
+    shape: CullShape,
+    /// 被剔除的类型登记。
+    culled: HashMap<EntityTypeId, CulledType>,
+    /// 本帧可见集（每个剔除类型一个桶，空桶 = 该类型本帧无可见实体）。
+    visible: HashMap<EntityTypeId, Vec<InstanceId>>,
+    /// 本帧剔除是否生效（相机在场且位姿可投影）。false ⇒ 消费侧退化全可见兜底。
+    active: bool,
 }
 
 /// 第二个 runtime 实例：动态帧率的 render 侧。
@@ -102,6 +142,8 @@ pub struct RenderRuntime {
     /// 正在淡出的尸体：(实例, 剩余秒)。每 render 帧 `-= dt` 并写淡出字段；≤0 回收行。
     /// sim 复用同 id 重生时，出生摄入按 (类型,id) 清除残项（重生即时夺回行）。
     dying: Vec<(InstanceId, f64)>,
+    /// render 侧空间索引 / 可见集剔除 / LOD（`None` = 未启用，行为与今日相同）。
+    spatial: Option<Spatial>,
 }
 
 impl RenderRuntime {
@@ -131,6 +173,7 @@ impl RenderRuntime {
             renderables: vec![],
             death_fade: HashMap::new(),
             dying: vec![],
+            spatial: None,
         }
     }
 
@@ -249,7 +292,14 @@ impl RenderRuntime {
     /// 实体，读绑定字段，剔除不可见 / 已淡尽者，产出有序 [`RenderPacket`] 列。
     /// 只读——在 [`RenderRuntime::render_frame`] 之后调用，取走本帧渲染语义数据交后端。
     pub fn submit(&self) -> SubmissionView {
-        submission::assemble(&self.store, &self.renderables)
+        // 剔除生效时把可见集传给装配器（剔除类型只装可见者）；否则 None = 全装（含相机
+        // 缺席兜底、未启用剔除）。
+        let visible = self
+            .spatial
+            .as_ref()
+            .filter(|sp| sp.active)
+            .map(|sp| &sp.visible);
+        submission::assemble(&self.store, &self.renderables, visible)
     }
 
     /// 开启某类型的 render 自管死亡淡出：sim 写死后，render 不即时回收行，而是在
@@ -276,6 +326,110 @@ impl RenderRuntime {
         }
         self.claim_writes(ty, &[fade_field], &format!("death_fade({})", ty.0))?;
         self.death_fade.insert(ty, (fade_field, duration));
+        Ok(())
+    }
+
+    /// 启用 render 侧剔除 / LOD（§6.1「物化为索引实体」的 render 对偶）：建一份 render
+    /// 私有 [`SpatialGrid`]（`cell_size` ≥ 最大交互直径 / cull 形状跨度，见其文档），设
+    /// 全局投影平面 `axes`（Vec3 平移取哪两分量入网格），designate 相机实例 `camera` +
+    /// 其位姿 render 字段 `cam_pos`（须已存在；由 track/continuous 按 render-rate 维护）
+    /// + cull 形状 `shape`。随后用 [`RenderRuntime::cull_type`] 把各类型 opt-in。
+    ///
+    /// 未调用此法时 render 行为与今日逐字相同（`continuous`/`submit` 扫全部存活）。
+    /// 重复启用即错。
+    pub fn enable_culling(
+        &mut self,
+        cell_size: f64,
+        axes: Axes,
+        camera: InstanceId,
+        cam_pos: RFieldId,
+        shape: CullShape,
+    ) -> Result<(), String> {
+        if self.spatial.is_some() {
+            return Err("已启用剔除（enable_culling 只能调一次）".into());
+        }
+        if !(cell_size.is_finite() && cell_size > 0.0) {
+            return Err(format!("cell_size 须为有限正数（给 {cell_size}）"));
+        }
+        if !shape.is_valid() {
+            return Err("cull 形状参数须为有限正数".into());
+        }
+        if !self.store.has_render_field(camera.ty, cam_pos) {
+            return Err(format!("相机位姿字段 {}.{} 不存在", camera.ty.0, cam_pos.0));
+        }
+        self.spatial = Some(Spatial {
+            grid: SpatialGrid::new(cell_size),
+            axes,
+            camera,
+            cam_pos,
+            shape,
+            culled: HashMap::new(),
+            visible: HashMap::new(),
+            active: false,
+        });
+        Ok(())
+    }
+
+    /// 把某类型 opt-in 进 render 剔除：其 `translation_sim_field`（**须已 [`track`]**，
+    /// 否则无 tracked 增量喂网格——此处即错）的位喂入网格，该类型的 `continuous` /
+    /// `submit` 每帧收窄到相机视域内的可见集。`dist_field` 可选——给定则每帧把可见
+    /// 实体到相机的距离写入它（走 `claim_writes` D1 登记，runtime 独占写，与 track 输出 /
+    /// fade 同纪律），供开发者读取 + [`lod_band`] 自行分档 LOD。须先 `enable_culling`。
+    /// 重复 cull 同类型即错。
+    ///
+    /// [`track`]: RenderRuntime::track
+    pub fn cull_type(
+        &mut self,
+        ty: EntityTypeId,
+        translation_sim_field: FieldId,
+        dist_field: Option<RFieldId>,
+    ) -> Result<(), String> {
+        if self.spatial.is_none() {
+            return Err("须先 enable_culling 再 cull_type".into());
+        }
+        if !self.track_of.contains_key(&(ty, translation_sim_field)) {
+            return Err(format!(
+                "cull_type 要求 {}.{} 已被 track（剔除靠 tracked position 增量喂网格）",
+                ty.0, translation_sim_field.0
+            ));
+        }
+        if self.spatial.as_ref().unwrap().culled.contains_key(&ty) {
+            return Err(format!("类型 {} 已 cull", ty.0));
+        }
+        // dist_field 走 D1 登记（runtime 独占写）。先登记再插登记表，错误路径不留脏态。
+        if let Some(df) = dist_field {
+            self.claim_writes(ty, &[df], &format!("visible_set_dist({})", ty.0))?;
+        }
+        let track_slot = self
+            .track_of
+            .get(&(ty, translation_sim_field))
+            .and_then(|tis| tis.first())
+            .map(|&ti| self.tracks[ti].slot)
+            .expect("cull_type 已验证 translation_sim_field 被 track");
+        let axes = self.spatial.as_ref().unwrap().axes;
+        let mut live = vec![];
+        self.store.for_each_live(ty, |inst| live.push(inst));
+        let mut backfill = vec![];
+        for inst in live {
+            if let Some((_prev, cur)) = self.store.track_pair(inst, track_slot)
+                && let Some((x, y)) = axes.project(&cur)
+            {
+                backfill.push((inst, x, y));
+            }
+        }
+        self.spatial.as_mut().unwrap().culled.insert(
+            ty,
+            CulledType {
+                translation_field: translation_sim_field,
+                track_slot,
+                dist_field,
+            },
+        );
+        let sp = self.spatial.as_mut().unwrap();
+        sp.visible.entry(ty).or_default();
+        for (inst, x, y) in backfill {
+            sp.grid.update(inst, x, y);
+        }
         Ok(())
     }
 
@@ -348,8 +502,24 @@ impl RenderRuntime {
         //    sim 默认值；这里把输出字段也 snap 一次（未被 init 写入的 tracked 字段否则
         //    永远停在 Null——若同帧 init 携带了值，下面的 apply_delta 会再覆盖）。
         for &inst in &sf.births {
+            // 重生即时夺回行：清除该 (类型,id) 残留的网格/淡出/活动项。须在 birth
+            // 重置 render 行之前做，因为 same-frame destroy+spawn 的旧代际此刻还可能
+            // 是当前行；若先切到新代际，随后旧代际 death-fade 分支会因不在场而无法清理。
+            if self.spatial.is_some() {
+                let stale: Vec<InstanceId> = self
+                    .dying
+                    .iter()
+                    .filter(|(d, _)| d.ty == inst.ty && d.id == inst.id)
+                    .map(|(d, _)| *d)
+                    .collect();
+                if let Some(sp) = self.spatial.as_mut() {
+                    sp.grid.remove_slot(inst);
+                    for d in stale {
+                        sp.grid.remove(d);
+                    }
+                }
+            }
             self.store.birth(inst);
-            // 重生即时夺回行：清除该 (类型,id) 残留的淡出尸体项（旧代际，行已被重置）。
             self.dying
                 .retain(|(d, _)| !(d.ty == inst.ty && d.id == inst.id));
             self.active
@@ -367,6 +537,23 @@ impl RenderRuntime {
                         .unwrap_or(Value::Null);
                     self.store
                         .write_render(inst, tr.out, tr.kind.out_default(&default));
+                }
+            }
+            // 出生即入网格（剔除类型）：按 sim 默认平移投影喂入，否则「出生后从不写
+            // position」的静止实体永不进网格 = 永远被剔除。随后 position 增量再 refine。
+            let feed = self.spatial.as_ref().and_then(|sp| {
+                sp.culled
+                    .get(&inst.ty)
+                    .map(|ct| (ct.translation_field, sp.axes))
+            });
+            if let Some((tf, axes)) = feed {
+                let def = self
+                    .sim_defaults
+                    .get(&(inst.ty, tf))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if let Some((x, y)) = axes.project(&def) {
+                    self.spatial.as_mut().unwrap().grid.update(inst, x, y);
                 }
             }
         }
@@ -404,6 +591,25 @@ impl RenderRuntime {
                     }
                 }
             }
+            // 喂网格（剔除类型的平移增量 → 把住户更新到最新 sim 位 cur）。仅对在场实体，
+            // 避免已死 / 未生的陈旧增量造幽灵住户。
+            let feed_axes = self.spatial.as_ref().and_then(|sp| {
+                sp.culled
+                    .get(&d.inst.ty)
+                    .filter(|ct| ct.translation_field == d.sim_field)
+                    .map(|_| sp.axes)
+            });
+            if let Some(axes) = feed_axes {
+                if self.store.is_present(d.inst) {
+                    if let Some((x, y)) = axes.project(&d.new) {
+                        self.spatial.as_mut().unwrap().grid.update(d.inst, x, y);
+                    } else {
+                        self.spatial.as_mut().unwrap().grid.remove(d.inst);
+                    }
+                } else {
+                    self.spatial.as_mut().unwrap().grid.remove(d.inst);
+                }
+            }
         }
         for (inst, ti) in prev_active {
             if !new_set.contains(&(inst, ti)) {
@@ -422,10 +628,18 @@ impl RenderRuntime {
         // 4. 死亡：有淡出策略的类型 render 接管寿命（进入 dying，行暂留）；否则即时回收。
         for &inst in &sf.deaths {
             if let Some(&(_ff, dur)) = self.death_fade.get(&inst.ty) {
-                self.push_dying(inst, dur);
+                if !self.push_dying(inst, dur)
+                    && let Some(sp) = self.spatial.as_mut()
+                {
+                    sp.grid.remove(inst);
+                }
             } else {
                 self.store.death(inst);
                 self.active.retain(|(a, _)| *a != inst);
+                // 即时死亡 → 从网格移除（淡出类型留到淡尽回收时移，见 advance_dying）。
+                if let Some(sp) = self.spatial.as_mut() {
+                    sp.grid.remove(inst);
+                }
             }
         }
         self.last_ingested = sf.sim_frame;
@@ -442,24 +656,42 @@ impl RenderRuntime {
             let tr = self.tracks[ti];
             if let Some((prev, cur)) = self.store.track_pair(inst, tr.slot) {
                 let out = tr.kind.sample(&prev, &cur, alpha);
+                let cull_axes = self.spatial.as_ref().and_then(|sp| {
+                    sp.culled
+                        .get(&inst.ty)
+                        .filter(|ct| ct.track_slot == tr.slot)
+                        .map(|_| sp.axes)
+                });
+                if let Some(axes) = cull_axes {
+                    if let Some((x, y)) = axes.project(&out) {
+                        self.spatial.as_mut().unwrap().grid.update(inst, x, y);
+                    } else {
+                        self.spatial.as_mut().unwrap().grid.remove(inst);
+                    }
+                }
                 self.store.write_render(inst, tr.out, out);
                 still_active.push((inst, ti));
             }
         }
         self.active = still_active;
-        self.run_continuous();
         self.advance_dying(self.clock.dt);
+        // 算可见集（相机 render-rate 查询网格）+ 写距离字段，再据此收窄 continuous。
+        // 置于插值扫之后：相机位姿若由 track 驱动，本帧已插值到位（零延迟）；若由
+        // continuous 驱动则用上一帧相机位（1 帧延迟，cull 余量吸收）。未启用剔除时空操作。
+        self.compute_visible();
+        self.run_continuous();
     }
 
-    fn push_dying(&mut self, inst: InstanceId, duration: f64) {
+    fn push_dying(&mut self, inst: InstanceId, duration: f64) -> bool {
         if !self.store.is_present(inst) {
-            return;
+            return false;
         }
         if let Some((_, remaining)) = self.dying.iter_mut().find(|(d, _)| *d == inst) {
             *remaining = remaining.min(duration);
-            return;
+            return true;
         }
         self.dying.push((inst, duration));
+        true
     }
 
     /// 推进死亡淡出：每 render 帧对淡出中的尸体 `剩余 -= dt`，写淡出权重
@@ -486,6 +718,10 @@ impl RenderRuntime {
             } else {
                 self.store.death(inst); // 淡尽：真正回收行（render 寿命终结）。
                 reclaimed.push(inst);
+                // 淡尽回收 → 从网格移除（淡出窗口内一直留在网格，故淡出期仍进可见集、照画）。
+                if let Some(sp) = self.spatial.as_mut() {
+                    sp.grid.remove(inst);
+                }
             }
         }
         for inst in reclaimed {
@@ -505,14 +741,100 @@ impl RenderRuntime {
         self.render_frame(dt, alpha);
     }
 
+    /// 算本 render 帧的可见集（§6.1 render 对偶的查询端）：读相机位姿、对网格做形状查询、
+    /// 按剔除类型分桶，并把每个可见实体到相机的距离写入其 `dist_field`（若配置）。相机
+    /// 缺席 / 位姿不可投影 ⇒ `active = false`，消费侧退化为全可见（避免黑屏）。未启用剔除
+    /// ⇒ 直接返回。
+    fn compute_visible(&mut self) {
+        // 先把 Copy 配置取出，避免后续与 grid / visible / store 借用打架。
+        let Some((camera, cam_pos, axes, shape)) = self
+            .spatial
+            .as_ref()
+            .map(|sp| (sp.camera, sp.cam_pos, sp.axes, sp.shape))
+        else {
+            return;
+        };
+        // 1. 重置上帧可见集：每个剔除类型清空桶（保留容量），active 暂置 false。空桶 ≠ 无桶：
+        //    剔除类型即使本帧 0 可见也须有桶，否则消费侧 `get(ty)=None` 会误退化为全扫。
+        {
+            let sp = self.spatial.as_mut().unwrap();
+            let tys: Vec<EntityTypeId> = sp.culled.keys().copied().collect();
+            for ty in tys {
+                sp.visible.entry(ty).or_default().clear();
+            }
+            sp.active = false;
+        }
+        // 2. 相机投影点（缺席 / 不可投影 → active 留 false：消费侧全可见兜底）。
+        if !self.store.is_present(camera) {
+            return;
+        }
+        let cam_val = self.store.read_render(camera, cam_pos);
+        let Some((cx, cy)) = axes.project(&cam_val) else {
+            return;
+        };
+        // 3. 形状查询网格（含各剔除类型住户，确定序）。
+        let hits = {
+            let sp = self.spatial.as_ref().unwrap();
+            shape.query(&sp.grid, cx, cy)
+        };
+        let mut live_hits = vec![];
+        let mut stale_hits = vec![];
+        for inst in hits {
+            if self.store.is_present(inst) {
+                live_hits.push(inst);
+            } else {
+                stale_hits.push(inst);
+            }
+        }
+        // 4. 分桶 + 收集距离写（距离用网格存的 cur 位，与 cull 成员判定同源）。
+        let mut dist_writes: Vec<(InstanceId, RFieldId, f64)> = vec![];
+        {
+            let sp = self.spatial.as_mut().unwrap();
+            for inst in stale_hits {
+                sp.grid.remove(inst);
+            }
+            for inst in live_hits {
+                let Some(ct) = sp.culled.get(&inst.ty).copied() else {
+                    continue; // 网格里只该有剔除类型，稳妥起见跳过未登记者。
+                };
+                if let Some(df) = ct.dist_field {
+                    let dist = sp
+                        .grid
+                        .position(inst)
+                        .map_or(0.0, |(ex, ey)| (ex - cx).hypot(ey - cy));
+                    dist_writes.push((inst, df, dist));
+                }
+                sp.visible.entry(inst.ty).or_default().push(inst);
+            }
+            sp.active = true;
+        }
+        // 5. 距离写进各可见实体的 dist_field（runtime 独占写，D1 已登记）。
+        for (inst, df, dist) in dist_writes {
+            self.store.write_render(inst, df, Value::Float(dist));
+        }
+    }
+
     fn run_continuous(&mut self) {
         let detect = self.detect;
         for ci in 0..self.continuous.len() {
             let ty = self.continuous[ci].ty;
             let name = self.continuous[ci].name.clone();
             let declared = self.continuous[ci].writes.clone();
+            // 剔除类型且本帧剔除生效 → 只扫可见集（离屏实体派生 render 态冻结，回屏即续，
+            // 正是剔除本意）；否则（未剔除 / 相机缺席兜底）稠密扫存活。
             let mut insts = vec![];
-            self.store.for_each_live(ty, |i| insts.push(i));
+            let narrowed = self
+                .spatial
+                .as_ref()
+                .is_some_and(|sp| sp.active && sp.culled.contains_key(&ty));
+            if narrowed {
+                if let Some(vis) = self.spatial.as_ref().unwrap().visible.get(&ty) {
+                    insts.extend_from_slice(vis);
+                }
+                insts.retain(|&inst| self.store.is_present(inst));
+            } else {
+                self.store.for_each_live(ty, |i| insts.push(i));
+            }
             for inst in insts {
                 let writes = {
                     let mut ctx = RenderCtx {

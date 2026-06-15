@@ -92,6 +92,14 @@ impl SpatialGrid {
         self.entries.is_empty()
     }
 
+    /// 某住户当前的精确坐标（不在网格则 `None`）。供消费方在广相位命中后算精确距离
+    /// （如 render 剔除的 LOD 距离），复用网格已存的位、免回原存储重读；与查询的成员
+    /// 判定同源（都基于这份 `entries`）。
+    #[inline]
+    pub fn position(&self, id: InstanceId) -> Option<(f64, f64)> {
+        self.entries.get(&id).map(|e| (e.x, e.y))
+    }
+
     #[inline]
     fn cell_of_checked(&self, x: f64, y: f64) -> Option<(i32, i32)> {
         fn axis(v: f64, inv_cell: f64) -> Option<i32> {
@@ -100,6 +108,24 @@ impl SpatialGrid {
             }
             let c = (v * inv_cell).floor();
             (c >= i32::MIN as f64 && c <= i32::MAX as f64).then_some(c as i32)
+        }
+        Some((axis(x, self.inv_cell)?, axis(y, self.inv_cell)?))
+    }
+
+    #[inline]
+    fn cell_of_clamped(&self, x: f64, y: f64) -> Option<(i32, i32)> {
+        fn axis(v: f64, inv_cell: f64) -> Option<i32> {
+            if !v.is_finite() {
+                return None;
+            }
+            let c = (v * inv_cell).floor();
+            if c < i32::MIN as f64 {
+                Some(i32::MIN)
+            } else if c > i32::MAX as f64 {
+                Some(i32::MAX)
+            } else {
+                Some(c as i32)
+            }
         }
         Some((axis(x, self.inv_cell)?, axis(y, self.inv_cell)?))
     }
@@ -130,6 +156,20 @@ impl SpatialGrid {
         }
     }
 
+    /// 移除同一逻辑槽位（同 type/id、任意 generation）的所有住户。render culling 在
+    /// same-frame destroy+spawn 复用 id 时用它清理旧代际，避免 ABA 幽灵。
+    pub(crate) fn remove_slot(&mut self, id: InstanceId) {
+        let stale: Vec<InstanceId> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|e| e.ty == id.ty && e.id == id.id)
+            .collect();
+        for stale in stale {
+            self.remove(stale);
+        }
+    }
+
     fn detach(&mut self, id: InstanceId, cell: (i32, i32)) {
         if let Some(v) = self.cells.get_mut(&cell) {
             if let Some(p) = v.iter().position(|&x| x == id) {
@@ -143,15 +183,24 @@ impl SpatialGrid {
 
     /// 矩形范围查询：返回精确坐标落在闭区间 [min, max]² 内的全部住户（确定序）。
     pub fn query_aabb(&self, min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<InstanceId> {
-        if min_x > max_x || min_y > max_y {
+        if min_x > max_x
+            || min_y > max_y
+            || !min_x.is_finite()
+            || !min_y.is_finite()
+            || !max_x.is_finite()
+            || !max_y.is_finite()
+        {
             return vec![];
         }
-        let Some((cx0, cy0)) = self.cell_of_checked(min_x, min_y) else {
+        let Some((cx0, cy0)) = self.cell_of_clamped(min_x, min_y) else {
             return vec![];
         };
-        let Some((cx1, cy1)) = self.cell_of_checked(max_x, max_y) else {
+        let Some((cx1, cy1)) = self.cell_of_clamped(max_x, max_y) else {
             return vec![];
         };
+        if self.range_too_wide(cx0, cy0, cx1, cy1) {
+            return self.query_aabb_by_entries(min_x, min_y, max_x, max_y);
+        }
         let mut out = vec![];
         for cx in cx0..=cx1 {
             for cy in cy0..=cy1 {
@@ -171,16 +220,19 @@ impl SpatialGrid {
 
     /// 半径查询（AoI / 范围查询）：返回到 (cx, cy) 欧氏距离 ≤ r 的全部住户（确定序）。
     pub fn query_radius(&self, cx: f64, cy: f64, r: f64) -> Vec<InstanceId> {
-        if !r.is_finite() || r < 0.0 {
+        if !cx.is_finite() || !cy.is_finite() || !r.is_finite() || r < 0.0 {
             return vec![];
         }
         let r2 = r * r;
-        let Some((gx0, gy0)) = self.cell_of_checked(cx - r, cy - r) else {
+        let Some((gx0, gy0)) = self.cell_of_clamped(cx - r, cy - r) else {
             return vec![];
         };
-        let Some((gx1, gy1)) = self.cell_of_checked(cx + r, cy + r) else {
+        let Some((gx1, gy1)) = self.cell_of_clamped(cx + r, cy + r) else {
             return vec![];
         };
+        if self.range_too_wide(gx0, gy0, gx1, gy1) {
+            return self.query_radius_by_entries(cx, cy, r2);
+        }
         let mut out = vec![];
         for gx in gx0..=gx1 {
             for gy in gy0..=gy1 {
@@ -193,6 +245,43 @@ impl SpatialGrid {
                         }
                     }
                 }
+            }
+        }
+        out.sort_by_key(key);
+        out
+    }
+
+    fn range_too_wide(&self, x0: i32, y0: i32, x1: i32, y1: i32) -> bool {
+        let width = (x1 as i64 - x0 as i64 + 1) as u128;
+        let height = (y1 as i64 - y0 as i64 + 1) as u128;
+        let scanned_cells = width.saturating_mul(height);
+        let exact_scan_budget = ((self.entries.len() as u128).saturating_mul(4)).max(64);
+        scanned_cells > exact_scan_budget
+    }
+
+    fn query_aabb_by_entries(
+        &self,
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+    ) -> Vec<InstanceId> {
+        let mut out = vec![];
+        for (&id, e) in &self.entries {
+            if e.x >= min_x && e.x <= max_x && e.y >= min_y && e.y <= max_y {
+                out.push(id);
+            }
+        }
+        out.sort_by_key(key);
+        out
+    }
+
+    fn query_radius_by_entries(&self, cx: f64, cy: f64, r2: f64) -> Vec<InstanceId> {
+        let mut out = vec![];
+        for (&id, e) in &self.entries {
+            let (dx, dy) = (e.x - cx, e.y - cy);
+            if dx * dx + dy * dy <= r2 {
+                out.push(id);
             }
         }
         out.sort_by_key(key);

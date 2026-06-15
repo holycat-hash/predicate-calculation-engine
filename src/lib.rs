@@ -80,8 +80,8 @@ pub use calculation::{CalcId, Ctx, Input};
 pub use entity::{CellAddr, EntityTypeId, FieldDef, FieldId, InstanceId};
 pub use predicate::{CmpOp, Cond, Delivery, Dir, Expr, FoldOp, Predicate, Proj, Scope, ValRef};
 pub use render::{
-    Interp, Publisher, RFieldId, RenderBinding, RenderClock, RenderCtx, RenderInput, RenderPacket,
-    RenderRuntime, SimFrame, SubmissionView,
+    lod_band, Axes, CullShape, Interp, Publisher, RFieldId, RenderBinding, RenderClock, RenderCtx,
+    RenderInput, RenderPacket, RenderRuntime, SimFrame, SubmissionView,
 };
 pub use runtime::{
     CalcOptions, Detect, Determinism, Profile, Residency, RowPolicy, Runtime, Schedule,

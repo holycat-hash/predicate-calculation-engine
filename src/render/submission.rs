@@ -12,7 +12,9 @@
 //! render 帧的终端读出（§6.1「物化为可见集实体」的消费端：剔除把可见集收窄，提交
 //! 只扫可见集）。
 
-use crate::entity::InstanceId;
+use std::collections::HashMap;
+
+use crate::entity::{EntityTypeId, InstanceId};
 use crate::value::Value;
 
 use super::store::{RFieldId, RenderStore};
@@ -85,15 +87,30 @@ impl SubmissionView {
 
 /// 从一组渲染绑定装配提交视图。逐类型按注册序、类型内按 render 行序扫描存活
 /// （含淡出中的）实体，读绑定字段，剔除不可见 / 已淡尽者。
+///
+/// `visible`（[`super::RenderRuntime`] 本帧算出的可见集）若为 `Some` 且含某类型，则该
+/// 类型只扫可见集（空间剔除收窄候选，§6.1 的 render 对偶）；否则该类型扫全部存活。空间
+/// 剔除与逐实体的 `visibility` / `fade` 字段正交叠加——前者收窄候选，后者再细筛。
 pub(super) fn assemble(
     store: &RenderStore,
-    renderables: &[(crate::entity::EntityTypeId, RenderBinding)],
+    renderables: &[(EntityTypeId, RenderBinding)],
+    visible: Option<&HashMap<EntityTypeId, Vec<InstanceId>>>,
 ) -> SubmissionView {
     let mut packets = vec![];
     for (ty, b) in renderables {
-        let mut insts = vec![];
-        store.for_each_live(*ty, |i| insts.push(i));
+        // 剔除类型（可见集含该 ty）只扫可见集；否则稠密扫存活（含淡出中）。
+        let insts: Vec<InstanceId> = match visible.and_then(|m| m.get(ty)) {
+            Some(vis) => vis.clone(),
+            None => {
+                let mut v = vec![];
+                store.for_each_live(*ty, |i| v.push(i));
+                v
+            }
+        };
         for inst in insts {
+            if !store.is_present(inst) {
+                continue;
+            }
             // 剔除：绑定了可见性且读到 false。未绑定 / Null / true 一律可见（宽容默认）。
             if let Some(vf) = b.visibility
                 && matches!(store.read_render(inst, vf), Value::Bool(false))

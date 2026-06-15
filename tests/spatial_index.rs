@@ -79,6 +79,16 @@ fn grid_rejects_invalid_radius_and_handles_edge_cells() {
     let mut g = SpatialGrid::new(1.0);
     g.update(a, i32::MAX as f64, 0.0);
     assert!(g.query_radius(i32::MAX as f64, 0.0, -1.0).is_empty());
+    assert_eq!(
+        g.query_radius(i32::MAX as f64, 0.0, 1.0),
+        vec![a],
+        "查询区域部分越过 i32 cell 上界时仍应命中精确坐标在半径内的住户"
+    );
+    assert_eq!(
+        g.query_aabb(i32::MAX as f64 - 1.0, -1.0, i32::MAX as f64 + 1.0, 1.0),
+        vec![a],
+        "AABB 部分越过 i32 cell 上界时仍应命中边界住户"
+    );
     assert!(g.candidate_pairs().is_empty());
 }
 

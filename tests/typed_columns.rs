@@ -4,8 +4,9 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use pce::entity::FIELD_ALIVE;
 use pce::predicate::{lit, new_val, type_scope};
-use pce::{CmpOp, Cond, Delivery, Expr, FieldDef, Predicate, Runtime, Value};
+use pce::{CmpOp, Cond, Delivery, Expr, FieldDef, Predicate, RowPolicy, Runtime, ValRef, Value};
 
 fn field(name: &str, default: impl Into<Value>) -> FieldDef {
     FieldDef::new(name, default.into())
@@ -34,6 +35,51 @@ fn typed_column_deopt_preserves_values() {
     assert_eq!(rt.read(b, f_n), Value::Int(7));
     rt.debug_write(a, f_n, Value::Null);
     assert_eq!(rt.read(a, f_n), Value::Null);
+}
+
+#[test]
+fn vec3_quat_columns_deopt_and_path_components_preserve_values() {
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type_with(
+        "Unit",
+        vec![
+            field("pos", Value::vec3(0.0, 0.0, 0.0)),
+            field("rot", Value::quat_identity()),
+        ],
+        false,
+        RowPolicy::Compact,
+    );
+    let (f_pos, f_rot) = (rt.field(unit, "pos"), rt.field(unit, "rot"));
+
+    let a = rt.spawn(unit, vec![(f_pos, Value::vec3(1.0, 2.0, 3.0))]);
+    let b = rt.spawn(unit, vec![(f_rot, Value::quat(0.0, 0.0, 1.0, 0.0))]);
+    rt.step();
+    assert_eq!(rt.read(a, f_pos), Value::vec3(1.0, 2.0, 3.0));
+    assert_eq!(rt.read(b, f_rot), Value::quat(0.0, 0.0, 1.0, 0.0));
+    assert_eq!(
+        rt.read(a, f_pos).get_path(&["x".to_string()]),
+        Value::Float(1.0)
+    );
+    assert_eq!(
+        rt.read(b, f_rot).get_path(&["w".to_string()]),
+        Value::Float(0.0)
+    );
+
+    rt.debug_write(a, f_pos, Value::Null);
+    assert_eq!(rt.read(a, f_pos), Value::Null);
+    assert_eq!(
+        rt.read(b, f_pos),
+        Value::vec3(0.0, 0.0, 0.0),
+        "Vec3 deopt 不污染邻行"
+    );
+
+    rt.destroy(a);
+    rt.step();
+    assert_eq!(
+        rt.read(b, f_rot),
+        Value::quat(0.0, 0.0, 1.0, 0.0),
+        "Compact swap_remove 后 Quat 仍正确"
+    );
 }
 
 /// Bool 列（_alive 与普通 bool 字段）走无装箱快路；存活遍历正确。
@@ -70,6 +116,29 @@ fn debug_write_rejects_alive_field() {
     let alive = rt.field(unit, "_alive");
     let u = rt.spawn(unit, vec![]);
     rt.debug_write(u, alive, Value::Null);
+}
+
+/// calculation 不能绕过 destroy_self 把 `_alive` 写成非 Bool。
+#[test]
+#[should_panic(expected = "destroy_self")]
+fn calculation_write_rejects_alive_field() {
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![field("v", 0)], false);
+    let (cty, cframe) = {
+        let c = rt.clock();
+        (c.ty, c.f_frame)
+    };
+    rt.register_calculation(
+        "bad_life",
+        unit,
+        Predicate::new(type_scope(cty, cframe), Cond::True, Delivery::Each(vec![])),
+        &[FIELD_ALIVE],
+        Box::new(move |ctx, _| ctx.write(FIELD_ALIVE, Value::Null)),
+    )
+    .unwrap();
+
+    let _u = rt.spawn(unit, vec![]);
+    rt.step();
 }
 
 /// spawn 初始化非法字段时必须在分配前失败，不留下 live row / pending birth。
@@ -135,6 +204,49 @@ fn precompiled_constant_arithmetic_condition() {
     rt.debug_write(u, f_hp, Value::Int(29)); // 命中
     rt.step();
     assert_eq!(rt.read(w0, f_hits), Value::Int(2));
+}
+
+#[test]
+fn vec3_component_bool_constant_bucket_does_not_miss_numeric_eq() {
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type(
+        "Unit",
+        vec![field("pos", Value::vec3(0.0, 0.0, 0.0))],
+        false,
+    );
+    let watch = rt.register_entity_type("Watch", vec![field("hits", 0)], true);
+    let f_pos = rt.field(unit, "pos");
+    let f_hits = rt.field(watch, "hits");
+    rt.register_calculation(
+        "x_is_true",
+        watch,
+        Predicate::new(
+            type_scope(unit, f_pos),
+            Cond::Cmp(
+                Expr::Val(ValRef::New(vec!["x".to_string()])),
+                CmpOp::Eq,
+                Expr::Val(ValRef::Const(Value::Bool(true))),
+            ),
+            Delivery::Each(vec![]),
+        ),
+        &[f_hits],
+        Box::new(move |ctx, _| {
+            let n = ctx.read_own(f_hits).as_i64().unwrap();
+            ctx.write(f_hits, n + 1);
+        }),
+    )
+    .unwrap();
+
+    let u = rt.spawn(unit, vec![]);
+    let w0 = rt.alive(watch)[0];
+    rt.step();
+    rt.debug_write(u, f_pos, Value::vec3(1.0, 0.0, 0.0));
+    rt.step();
+    assert_eq!(
+        rt.read(w0, f_hits),
+        Value::Int(1),
+        "Float(1.0) 分量与 Bool(true) 的等值桶不漏触发"
+    );
 }
 
 /// 谓词预编译：复合 And/Or/AndNot 后缀求值与原 AST 逐字等价。

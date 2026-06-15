@@ -990,6 +990,13 @@ fn run_triggers(
         spawns.extend(sp);
         let rc = &calcs[t.calc.0 as usize];
         for (field, v) in writes {
+            if field == FIELD_ALIVE {
+                assert!(
+                    matches!(v, Value::Bool(false)),
+                    "calculation {} 只能通过 destroy_self() 写 _alive=false",
+                    rc.name
+                );
+            }
             assert!(
                 rc.declared_writes.contains(&field) || field == FIELD_ALIVE,
                 "calculation {} 写了未声明字段（D1 要求静态写集）",

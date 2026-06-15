@@ -25,15 +25,23 @@ pub struct RenderClock {
 
 impl RenderClock {
     pub fn new() -> Self {
-        RenderClock { frame: 0, dt: 0.0, alpha: 0.0 }
+        RenderClock {
+            frame: 0,
+            dt: 0.0,
+            alpha: 0.0,
+        }
     }
 
     /// 宿主循环每 render 帧调用：推进帧号、记录 dt、钳定 alpha 到 [0,1]
     /// （越界即外推区，本版钳到端点——平顺优先，不过冲，Cr2）。
     pub fn begin_frame(&mut self, dt: f64, alpha: f64) {
         self.frame += 1;
-        self.dt = dt.max(0.0);
-        self.alpha = alpha.clamp(0.0, 1.0);
+        self.dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        self.alpha = if alpha.is_finite() {
+            alpha.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
     }
 }
 

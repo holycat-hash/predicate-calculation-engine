@@ -198,7 +198,6 @@ fn fold_value(op: FoldOp, st: &FoldAcc) -> Value {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum VKey {
     Null,
-    Bool(bool),
     Int(i64),
     Str(String),
     Ref(EntityTypeId, u32, u32),
@@ -207,7 +206,7 @@ pub(crate) enum VKey {
 fn vkey(v: &Value) -> Option<VKey> {
     match v {
         Value::Null => Some(VKey::Null),
-        Value::Bool(b) => Some(VKey::Bool(*b)),
+        Value::Bool(b) => Some(VKey::Int(if *b { 1 } else { 0 })),
         Value::Int(i) => Some(VKey::Int(*i)),
         Value::Str(s) => Some(VKey::Str(s.clone())),
         Value::Ref(r) => Some(VKey::Ref(r.ty, r.id, r.generation)),

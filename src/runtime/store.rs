@@ -29,6 +29,11 @@ pub(crate) enum Column {
     Bool(Vec<bool>),
     Int(Vec<i64>),
     Float(Vec<f64>),
+    /// 三维向量列（平移 / 缩放 / 轴）。内联 `[f64;3]` SoA——transform 是 render
+    /// 最热、最频扫的数据，去装箱密度收益在此最大。
+    Vec3(Vec<[f64; 3]>),
+    /// 四元数列（方向）。内联 `[f64;4]` SoA。
+    Quat(Vec<[f64; 4]>),
     /// 装箱回退：异构 / Str / Ref / Map / Null 类型字段。
     Boxed(Vec<Value>),
 }
@@ -40,6 +45,8 @@ impl Column {
             Value::Bool(b) => Column::Bool(vec![*b; n]),
             Value::Int(i) => Column::Int(vec![*i; n]),
             Value::Float(f) => Column::Float(vec![*f; n]),
+            Value::Vec3(a) => Column::Vec3(vec![*a; n]),
+            Value::Quat(a) => Column::Quat(vec![*a; n]),
             other => Column::Boxed(vec![other.clone(); n]),
         }
     }
@@ -50,6 +57,8 @@ impl Column {
             Column::Bool(c) => c.get(row).map_or(Value::Null, |&b| Value::Bool(b)),
             Column::Int(c) => c.get(row).map_or(Value::Null, |&i| Value::Int(i)),
             Column::Float(c) => c.get(row).map_or(Value::Null, |&f| Value::Float(f)),
+            Column::Vec3(c) => c.get(row).map_or(Value::Null, |&a| Value::Vec3(a)),
+            Column::Quat(c) => c.get(row).map_or(Value::Null, |&a| Value::Quat(a)),
             Column::Boxed(c) => c.get(row).cloned().unwrap_or(Value::Null),
         }
     }
@@ -60,6 +69,8 @@ impl Column {
             (Column::Bool(c), Value::Bool(b)) => c[row] = *b,
             (Column::Int(c), Value::Int(i)) => c[row] = *i,
             (Column::Float(c), Value::Float(f)) => c[row] = *f,
+            (Column::Vec3(c), Value::Vec3(a)) => c[row] = *a,
+            (Column::Quat(c), Value::Quat(a)) => c[row] = *a,
             (Column::Boxed(c), _) => c[row] = v,
             _ => {
                 self.boxify();
@@ -76,6 +87,8 @@ impl Column {
             (Column::Bool(c), Value::Bool(b)) => c.push(*b),
             (Column::Int(c), Value::Int(i)) => c.push(*i),
             (Column::Float(c), Value::Float(f)) => c.push(*f),
+            (Column::Vec3(c), Value::Vec3(a)) => c.push(*a),
+            (Column::Quat(c), Value::Quat(a)) => c.push(*a),
             (Column::Boxed(c), _) => c.push(v),
             _ => {
                 self.boxify();
@@ -95,6 +108,12 @@ impl Column {
                 c.swap_remove(row);
             }
             Column::Float(c) => {
+                c.swap_remove(row);
+            }
+            Column::Vec3(c) => {
+                c.swap_remove(row);
+            }
+            Column::Quat(c) => {
                 c.swap_remove(row);
             }
             Column::Boxed(c) => {
@@ -126,6 +145,8 @@ impl Column {
             Column::Bool(c) => c.iter().map(|&b| Value::Bool(b)).collect(),
             Column::Int(c) => c.iter().map(|&i| Value::Int(i)).collect(),
             Column::Float(c) => c.iter().map(|&f| Value::Float(f)).collect(),
+            Column::Vec3(c) => c.iter().map(|&a| Value::Vec3(a)).collect(),
+            Column::Quat(c) => c.iter().map(|&a| Value::Quat(a)).collect(),
             Column::Boxed(_) => return,
         };
         *self = Column::Boxed(boxed);

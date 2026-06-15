@@ -110,6 +110,16 @@ impl RenderStore {
         slot
     }
 
+    pub fn has_type(&self, ty: EntityTypeId) -> bool {
+        self.types.get(ty.0 as usize).is_some()
+    }
+
+    pub fn has_render_field(&self, ty: EntityTypeId, f: RFieldId) -> bool {
+        self.types
+            .get(ty.0 as usize)
+            .is_some_and(|t| (f.0 as usize) < t.render_cols.len())
+    }
+
     #[inline]
     fn row_of(&self, inst: InstanceId) -> Option<usize> {
         let t = self.types.get(inst.ty.0 as usize)?;
@@ -143,7 +153,15 @@ impl RenderStore {
     /// 死亡：sim 写出 `_alive = false` 结算后由 render 摄入。行留洞待复用。
     pub fn death(&mut self, inst: InstanceId) {
         if let Some(id) = self.row_of(inst) {
-            self.types[inst.ty.0 as usize].live[id] = false;
+            let t = &mut self.types[inst.ty.0 as usize];
+            t.live[id] = false;
+            for (fi, col) in t.render_cols.iter_mut().enumerate() {
+                col[id] = t.render_defaults[fi].clone();
+            }
+            for tc in &mut t.tracks {
+                tc.prev[id] = tc.default.clone();
+                tc.cur[id] = tc.default.clone();
+            }
         }
     }
 
@@ -172,14 +190,22 @@ impl RenderStore {
 
     pub fn read_render(&self, inst: InstanceId, f: RFieldId) -> Value {
         match self.row_of(inst) {
-            Some(id) => self.types[inst.ty.0 as usize].render_cols[f.0 as usize][id].clone(),
+            Some(id) => self.types[inst.ty.0 as usize]
+                .render_cols
+                .get(f.0 as usize)
+                .map_or(Value::Null, |c| c[id].clone()),
             None => Value::Null,
         }
     }
 
     pub fn write_render(&mut self, inst: InstanceId, f: RFieldId, v: Value) {
         if let Some(id) = self.row_of(inst) {
-            self.types[inst.ty.0 as usize].render_cols[f.0 as usize][id] = v;
+            if let Some(col) = self.types[inst.ty.0 as usize]
+                .render_cols
+                .get_mut(f.0 as usize)
+            {
+                col[id] = v;
+            }
         }
     }
 
@@ -192,7 +218,11 @@ impl RenderStore {
         let t = &self.types[ty.0 as usize];
         for id in 0..t.row_gen.len() {
             if t.live[id] {
-                f(InstanceId { ty, id: id as u32, generation: t.row_gen[id] });
+                f(InstanceId {
+                    ty,
+                    id: id as u32,
+                    generation: t.row_gen[id],
+                });
             }
         }
     }

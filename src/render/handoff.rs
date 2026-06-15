@@ -9,9 +9,10 @@
 //! 事件写日志 + 生灭增量，是 O(|Δ|) 而非克隆整库。render 自己的 sidecar 维持
 //! tracked 镜像，逐帧增量套用（A8 的稀疏性在并发下照样成立）。
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::entity::{EntityTypeId, FieldId, InstanceId, FIELD_ALIVE};
+use crate::entity::{EntityTypeId, FIELD_ALIVE, FieldId, InstanceId};
 use crate::runtime::{Runtime, WriteRec};
 use crate::value::Value;
 
@@ -59,33 +60,50 @@ pub struct Publisher {
 
 impl Publisher {
     pub fn new(tracked_fields: Vec<(EntityTypeId, FieldId)>) -> Self {
-        Publisher { tracked_fields, queue: Mutex::new(vec![]) }
+        Publisher {
+            tracked_fields,
+            queue: Mutex::new(vec![]),
+        }
     }
 
     /// 某 (类型, 字段) 是否被 track（决定是否进 tracked 增量）。
     fn is_tracked(&self, ty: EntityTypeId, f: FieldId) -> bool {
-        self.tracked_fields.iter().any(|&(t, ff)| t == ty && ff == f)
+        self.tracked_fields
+            .iter()
+            .any(|&(t, ff)| t == ty && ff == f)
     }
 
     /// 从 sim runtime 当前帧的提交写集构建一份 [`SimFrame`]，发布给 render。
     /// 在 sim 线程、`rt.step()` 之后调用（此刻 `committed_writes` = 本帧写日志）。
     pub fn publish(&self, rt: &Runtime, sim_frame: u64) {
-        let mut frame = SimFrame { sim_frame, ..Default::default() };
+        let mut frame = SimFrame {
+            sim_frame,
+            ..Default::default()
+        };
+        let mut tracked_of: HashMap<(InstanceId, FieldId), usize> = HashMap::new();
+        let mut births = HashSet::new();
+        let mut deaths = HashSet::new();
         for rec in rt.committed_writes() {
             if rec.field == FIELD_ALIVE {
                 match &rec.new {
-                    Value::Bool(true) => frame.births.push(rec.inst),
-                    Value::Bool(false) => frame.deaths.push(rec.inst),
+                    Value::Bool(true) if births.insert(rec.inst) => frame.births.push(rec.inst),
+                    Value::Bool(false) if deaths.insert(rec.inst) => frame.deaths.push(rec.inst),
                     _ => {}
                 }
             }
             if self.is_tracked(rec.inst.ty, rec.field) {
-                frame.tracked.push(TrackedDelta {
-                    inst: rec.inst,
-                    sim_field: rec.field,
-                    old: rec.old.clone(),
-                    new: rec.new.clone(),
-                });
+                let key = (rec.inst, rec.field);
+                if let Some(&i) = tracked_of.get(&key) {
+                    frame.tracked[i].new = rec.new.clone();
+                } else {
+                    tracked_of.insert(key, frame.tracked.len());
+                    frame.tracked.push(TrackedDelta {
+                        inst: rec.inst,
+                        sim_field: rec.field,
+                        old: rec.old.clone(),
+                        new: rec.new.clone(),
+                    });
+                }
             }
             frame.events.push(rec.clone());
         }

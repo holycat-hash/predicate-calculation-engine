@@ -8,8 +8,9 @@
 //!    - render clock tick → 连续更新（[`RenderRuntime::continuous`]），ECS 稠密扫，
 //!      render 的主热路径（插值天生每帧）；
 //!    - 摄入的 sim 写日志 → 事件反应（[`RenderRuntime::reaction`]），复用谓词代数。
-//! 2. **生命周期 sim 独占**：render 无 spawn/destroy 共享实体的入口（你的约束）；
-//!    render 的 sidecar 行被动跟随 sim 的生灭增量。
+//! 2. **共享生命周期 sim 独占**：render 无 spawn/destroy 共享实体的入口（你的约束）；
+//!    render 的 sidecar 行被动跟随 sim 的生灭增量；若配置死亡淡出，render 只延迟
+//!    回收自己的 sidecar 行，不改变 sim 生死事实。
 //! 3. **字段级 D1 单向依赖**：render 只写 render 字段（[`store::RFieldId`]）、只读
 //!    sim 字段（经 tracked 镜像）；sim 永不读 render——并发解耦的结构强制（A7）。
 //!
@@ -23,7 +24,8 @@
 //!
 //! ## 成本（render 侧不变量）
 //! 每 render 帧：O(本 sim 区间在动 ∩ 存活) 的插值重算（A8 稀疏性经写日志延伸到
-//! 连续更新）+ O(存活) 的连续扫；每 sim 帧：O(|事件|) 的反应路由。剔除/LOD
+//! 连续更新）+ O(存活) 的连续扫；`submit()` 作为终端读出按可渲染类型扫 live rows；
+//! 每 sim 帧：O(|事件|) 的反应路由。剔除/LOD
 //! （Cr3，§6.1 物化为可见集实体）进一步压低存活扫的 N，留作后续。
 
 pub mod clock;
@@ -31,12 +33,14 @@ pub mod ctx;
 pub mod handoff;
 pub mod interp;
 pub mod store;
+pub mod submission;
 
 pub use clock::RenderClock;
 pub use ctx::{ContinuousFn, ReactionFn, RenderCtx, RenderInput};
 pub use handoff::{Publisher, SimFrame, TrackedDelta};
 pub use interp::{Interp, Track};
 pub use store::{RFieldId, RenderStore};
+pub use submission::{RenderBinding, RenderPacket, SubmissionView};
 
 use std::collections::{HashMap, HashSet};
 
@@ -84,6 +88,14 @@ pub struct RenderRuntime {
     last_ingested: u64,
     /// 本 sim 区间在动、需每 render 帧重算插值的 (实例, track 下标)（A8 稀疏集）。
     active: Vec<(InstanceId, usize)>,
+    /// 可渲染类型的提交绑定（注册序）：[`submission::assemble`] 据此装配提交视图。
+    renderables: Vec<(EntityTypeId, RenderBinding)>,
+    /// render 自管寿命（死亡淡出）：类型 → (淡出权重字段, 淡出时长秒)。sim 写死后，
+    /// 该类型实体不即时回收 render 行，而是按真实 dt 把权重 1→0 推过去，到 0 才回收。
+    death_fade: HashMap<EntityTypeId, (RFieldId, f64)>,
+    /// 正在淡出的尸体：(实例, 剩余秒)。每 render 帧 `-= dt` 并写淡出字段；≤0 回收行。
+    /// sim 复用同 id 重生时，出生摄入按 (类型,id) 清除残项（重生即时夺回行）。
+    dying: Vec<(InstanceId, f64)>,
 }
 
 impl RenderRuntime {
@@ -109,6 +121,9 @@ impl RenderRuntime {
             clock: RenderClock::new(),
             last_ingested: 0,
             active: vec![],
+            renderables: vec![],
+            death_fade: HashMap::new(),
+            dying: vec![],
         }
     }
 
@@ -130,13 +145,23 @@ impl RenderRuntime {
         sim_field: FieldId,
         kind: Interp,
     ) -> Result<RFieldId, String> {
-        let default = self.sim_defaults.get(&(ty, sim_field)).cloned().unwrap_or(Value::Null);
+        let default = self
+            .sim_defaults
+            .get(&(ty, sim_field))
+            .cloned()
+            .unwrap_or(Value::Null);
         let out = self.store.add_render_field(ty, Value::Null);
         // 输出字段走 D1 登记（out 恒为新铸 id，但宿主可手构 RFieldId 抢注，故仍检查）。
         self.claim_writes(ty, &[out], &format!("track({}.{})", ty.0, sim_field.0))?;
         let slot = self.store.add_track(ty, sim_field, default);
         let idx = self.tracks.len();
-        self.tracks.push(Track { ty, sim_field, out, slot, kind });
+        self.tracks.push(Track {
+            ty,
+            sim_field,
+            out,
+            slot,
+            kind,
+        });
         self.track_of.entry((ty, sim_field)).or_default().push(idx);
         Ok(out)
     }
@@ -189,10 +214,89 @@ impl RenderRuntime {
         Ok(())
     }
 
+    /// 声明某类型可渲染并绑定其提交字段（哪些 render 字段是 transform / handle /
+    /// 可见性 / 动画态 / 淡出）。[`RenderRuntime::submit`] 据此装配提交视图。每类型
+    /// 一份绑定，重复注册即错。绑定只引用已存在的 render 字段（track 输出 / 纯 render
+    /// 字段），不另立写权——故不走 D1 登记。
+    pub fn renderable(&mut self, ty: EntityTypeId, binding: RenderBinding) -> Result<(), String> {
+        if self.renderables.iter().any(|(t, _)| *t == ty) {
+            return Err(format!("类型 {} 已注册 renderable 绑定", ty.0));
+        }
+        self.validate_render_binding(ty, &binding)?;
+        self.renderables.push((ty, binding));
+        Ok(())
+    }
+
+    /// 装配本 render 帧的提交视图（staging 数据）：逐可渲染类型扫存活（含淡出中）
+    /// 实体，读绑定字段，剔除不可见 / 已淡尽者，产出有序 [`RenderPacket`] 列。
+    /// 只读——在 [`RenderRuntime::render_frame`] 之后调用，取走本帧渲染语义数据交后端。
+    pub fn submit(&self) -> SubmissionView {
+        submission::assemble(&self.store, &self.renderables)
+    }
+
+    /// 开启某类型的 render 自管死亡淡出：sim 写死后，render 不即时回收行，而是在
+    /// `duration` 秒内把 `fade_field` 权重由 1 推到 0（按真实 dt 积分，非帧数——动态
+    /// 帧率下淡出时长稳定），到 0 才真正回收。淡出期内实体仍存活于 render（`alive`
+    /// 为真、进提交、`continuous` 继续 tick——死亡动画照播）。
+    ///
+    /// `fade_field` 由淡出机制独占写（走 D1 登记，冲突即错），其 schema 默认值应为
+    /// `Float(1.0)`（存活实体实心）。重复设同一类型即错。`duration` 须 `>0`。
+    pub fn set_death_fade(
+        &mut self,
+        ty: EntityTypeId,
+        fade_field: RFieldId,
+        duration: f64,
+    ) -> Result<(), String> {
+        if duration <= 0.0 {
+            return Err(format!("死亡淡出时长须 >0（给 {duration}）"));
+        }
+        if self.death_fade.contains_key(&ty) {
+            return Err(format!("类型 {} 已设死亡淡出", ty.0));
+        }
+        if !self.store.has_render_field(ty, fade_field) {
+            return Err(format!("死亡淡出字段 {}.{} 不存在", ty.0, fade_field.0));
+        }
+        self.claim_writes(ty, &[fade_field], &format!("death_fade({})", ty.0))?;
+        self.death_fade.insert(ty, (fade_field, duration));
+        Ok(())
+    }
+
+    fn validate_render_binding(
+        &self,
+        ty: EntityTypeId,
+        binding: &RenderBinding,
+    ) -> Result<(), String> {
+        if !self.store.has_type(ty) {
+            return Err(format!("无类型 id {}", ty.0));
+        }
+        let mut seen = HashSet::new();
+        for (slot, field) in render_binding_fields(binding) {
+            let Some(f) = field else { continue };
+            if !self.store.has_render_field(ty, f) {
+                return Err(format!(
+                    "renderable 绑定 {slot} 引用不存在字段 {}.{}",
+                    ty.0, f.0
+                ));
+            }
+            if !seen.insert(f) {
+                return Err(format!("renderable 重复绑定 render 字段 {}.{}", ty.0, f.0));
+            }
+        }
+        Ok(())
+    }
+
     /// D1 render 侧：render 字段静态归属唯一写者，注册期冲突即错。
     /// 先整片校验（含片内重复）再插入——失败时不留半截脏归属（错误路径整洁）。
-    fn claim_writes(&mut self, ty: EntityTypeId, writes: &[RFieldId], owner: &str) -> Result<(), String> {
+    fn claim_writes(
+        &mut self,
+        ty: EntityTypeId,
+        writes: &[RFieldId],
+        owner: &str,
+    ) -> Result<(), String> {
         for (i, &w) in writes.iter().enumerate() {
+            if !self.store.has_render_field(ty, w) {
+                return Err(format!("{owner} 声明不存在 render 字段 {}.{}", ty.0, w.0));
+            }
             if let Some(prev) = self.field_owner.get(&(ty, w)) {
                 return Err(format!(
                     "D1（render 侧）冲突：render 字段 {}.{} 已归属 {prev}",
@@ -227,49 +331,74 @@ impl RenderRuntime {
         //    永远停在 Null——若同帧 init 携带了值，下面的 apply_delta 会再覆盖）。
         for &inst in &sf.births {
             self.store.birth(inst);
+            // 重生即时夺回行：清除该 (类型,id) 残留的淡出尸体项（旧代际，行已被重置）。
+            self.dying
+                .retain(|(d, _)| !(d.ty == inst.ty && d.id == inst.id));
+            self.active
+                .retain(|(a, _)| !(a.ty == inst.ty && a.id == inst.id));
             for ti in 0..self.tracks.len() {
                 let tr = self.tracks[ti];
                 if tr.ty != inst.ty {
                     continue;
                 }
                 if let Some((prev, cur)) = self.store.track_pair(inst, tr.slot) {
-                    self.store.write_render(inst, tr.out, tr.kind.sample(&prev, &cur, 1.0));
+                    self.store
+                        .write_render(inst, tr.out, tr.kind.sample(&prev, &cur, 1.0));
                 }
             }
         }
         let births: HashSet<InstanceId> = sf.births.iter().copied().collect();
         // 2. tracked 增量 → 镜像 + 活动集（停动的 cell 结算到 cur）。同一 sim 字段的
         //    全部 track 都喂（track_of 是多值），否则除最后注册者外都停在默认值。
+        let mut deltas: Vec<TrackedDelta> = vec![];
+        let mut delta_of: HashMap<(InstanceId, FieldId), usize> = HashMap::new();
+        for d in &sf.tracked {
+            let key = (d.inst, d.sim_field);
+            if let Some(&i) = delta_of.get(&key) {
+                deltas[i].new = d.new.clone();
+            } else {
+                delta_of.insert(key, deltas.len());
+                deltas.push(d.clone());
+            }
+        }
         let prev_active = std::mem::take(&mut self.active);
         let mut new_active: Vec<(InstanceId, usize)> = vec![];
-        for d in &sf.tracked {
+        let mut new_set: HashSet<(InstanceId, usize)> = HashSet::new();
+        for d in &deltas {
             if let Some(tis) = self.track_of.get(&(d.inst.ty, d.sim_field)) {
                 let just_born = births.contains(&d.inst);
                 for &ti in tis {
                     let slot = self.tracks[ti].slot;
                     self.store
                         .apply_delta(d.inst, slot, d.old.clone(), d.new.clone(), just_born);
-                    new_active.push((d.inst, ti));
+                    if new_set.insert((d.inst, ti)) {
+                        new_active.push((d.inst, ti));
+                    }
                 }
             }
         }
-        let new_set: HashSet<(InstanceId, usize)> = new_active.iter().copied().collect();
         for (inst, ti) in prev_active {
             if !new_set.contains(&(inst, ti)) {
                 // 上一区间在动、本区间不动：把插值输出结算到静止位（= 上一区间 alpha=1
                 // 的取值，cur）。经 kind.sample 求值，保证与活动扫输出同型（Lerp 出 Float）。
                 let tr = self.tracks[ti];
                 if let Some((prev, cur)) = self.store.track_pair(inst, tr.slot) {
-                    self.store.write_render(inst, tr.out, tr.kind.sample(&prev, &cur, 1.0));
+                    self.store
+                        .write_render(inst, tr.out, tr.kind.sample(&prev, &cur, 1.0));
                 }
             }
         }
         self.active = new_active;
         // 3. 事件反应（订阅者 = writer，行仍存活；先于死亡结算）。
         self.run_reactions(sf);
-        // 4. 死亡：回收 render 行（v1 即时回收；render 自管寿命/淡出留作后续）。
+        // 4. 死亡：有淡出策略的类型 render 接管寿命（进入 dying，行暂留）；否则即时回收。
         for &inst in &sf.deaths {
-            self.store.death(inst);
+            if let Some(&(_ff, dur)) = self.death_fade.get(&inst.ty) {
+                self.push_dying(inst, dur);
+            } else {
+                self.store.death(inst);
+                self.active.retain(|(a, _)| *a != inst);
+            }
         }
         self.last_ingested = sf.sim_frame;
     }
@@ -280,15 +409,61 @@ impl RenderRuntime {
         let alpha = self.clock.alpha;
         // 插值扫：只碰本区间在动的 cell（稀疏）。静止物的输出字段已在结算时落到 cur。
         let active = std::mem::take(&mut self.active);
-        for &(inst, ti) in &active {
+        let mut still_active = Vec::with_capacity(active.len());
+        for (inst, ti) in active {
             let tr = self.tracks[ti];
             if let Some((prev, cur)) = self.store.track_pair(inst, tr.slot) {
                 let out = tr.kind.sample(&prev, &cur, alpha);
                 self.store.write_render(inst, tr.out, out);
+                still_active.push((inst, ti));
             }
         }
-        self.active = active;
+        self.active = still_active;
         self.run_continuous();
+        self.advance_dying(self.clock.dt);
+    }
+
+    fn push_dying(&mut self, inst: InstanceId, duration: f64) {
+        if !self.store.alive(inst) {
+            return;
+        }
+        if let Some((_, remaining)) = self.dying.iter_mut().find(|(d, _)| *d == inst) {
+            *remaining = remaining.min(duration);
+            return;
+        }
+        self.dying.push((inst, duration));
+    }
+
+    /// 推进死亡淡出：每 render 帧对淡出中的尸体 `剩余 -= dt`，写淡出权重
+    /// `(剩余/时长)∈[0,1]`，剩余 ≤0 则真正回收 render 行。take 出本地后处理，
+    /// 避免 `self.store` 可变借用与 `self.dying` 借用交叠。
+    fn advance_dying(&mut self, dt: f64) {
+        if self.dying.is_empty() {
+            return;
+        }
+        let dying = std::mem::take(&mut self.dying);
+        let mut still = Vec::with_capacity(dying.len());
+        let mut reclaimed = vec![];
+        for (inst, remaining) in dying {
+            if !self.store.alive(inst) {
+                continue;
+            }
+            let remaining = remaining - dt;
+            if let Some(&(ff, dur)) = self.death_fade.get(&inst.ty) {
+                let w = (remaining / dur).clamp(0.0, 1.0);
+                self.store.write_render(inst, ff, Value::Float(w));
+            }
+            if remaining > 0.0 {
+                still.push((inst, remaining));
+            } else {
+                self.store.death(inst); // 淡尽：真正回收行（render 寿命终结）。
+                reclaimed.push(inst);
+            }
+        }
+        for inst in reclaimed {
+            self.active.retain(|(a, _)| *a != inst);
+        }
+        self.dying = still;
     }
 
     /// 规范宿主入口：取走 publisher 全部未消费帧、顺序摄入（不丢生灭/事件），再推进
@@ -310,7 +485,12 @@ impl RenderRuntime {
             self.store.for_each_live(ty, |i| insts.push(i));
             for inst in insts {
                 let writes = {
-                    let mut ctx = RenderCtx { store: &self.store, self_id: inst, clock: self.clock, writes: vec![] };
+                    let mut ctx = RenderCtx {
+                        store: &self.store,
+                        self_id: inst,
+                        clock: self.clock,
+                        writes: vec![],
+                    };
                     (self.continuous[ci].f)(&mut ctx);
                     ctx.writes
                 };
@@ -351,7 +531,12 @@ impl RenderRuntime {
                     }
                     let rows = groups.remove(&inst).unwrap();
                     let writes = {
-                        let mut ctx = RenderCtx { store: &self.store, self_id: inst, clock: self.clock, writes: vec![] };
+                        let mut ctx = RenderCtx {
+                            store: &self.store,
+                            self_id: inst,
+                            clock: self.clock,
+                            writes: vec![],
+                        };
                         (self.reactions[ri].f)(&mut ctx, &RenderInput::Batch(rows));
                         ctx.writes
                     };
@@ -363,7 +548,12 @@ impl RenderRuntime {
                         continue;
                     }
                     let writes = {
-                        let mut ctx = RenderCtx { store: &self.store, self_id: inst, clock: self.clock, writes: vec![] };
+                        let mut ctx = RenderCtx {
+                            store: &self.store,
+                            self_id: inst,
+                            clock: self.clock,
+                            writes: vec![],
+                        };
                         (self.reactions[ri].f)(&mut ctx, &RenderInput::Each(row));
                         ctx.writes
                     };
@@ -401,6 +591,25 @@ impl RenderRuntime {
     pub fn active_count(&self) -> usize {
         self.active.len()
     }
+
+    /// 当前正在死亡淡出（render 接管寿命、尚未回收）的尸体数。
+    pub fn dying_count(&self) -> usize {
+        self.dying.len()
+    }
+}
+
+fn render_binding_fields(binding: &RenderBinding) -> [(&'static str, Option<RFieldId>); 9] {
+    [
+        ("translation", binding.translation),
+        ("rotation", binding.rotation),
+        ("scale", binding.scale),
+        ("mesh", binding.mesh),
+        ("material", binding.material),
+        ("visibility", binding.visibility),
+        ("anim_state", binding.anim_state),
+        ("anim_phase", binding.anim_phase),
+        ("fade", binding.fade),
+    ]
 }
 
 /// 写折叠（render 侧）：同 calc 一次运行对同 render 字段的多次写取最终值；D1 校验。
@@ -445,7 +654,7 @@ fn validate_reaction_cond(c: &Cond) -> Result<(), String> {
         Cond::Cmp(a, _, b) => expr_ok(a) && expr_ok(b),
         Cond::Crossed(t, _) => expr_ok(t),
         Cond::And(a, b) | Cond::Or(a, b) | Cond::AndNot(a, b) => {
-            return validate_reaction_cond(a).and(validate_reaction_cond(b))
+            return validate_reaction_cond(a).and(validate_reaction_cond(b));
         }
     };
     if ok {
@@ -478,7 +687,10 @@ fn eval_ro_expr(e: &Expr, new: &Value, old: &Value) -> Value {
 }
 
 fn ro_arith(a: &Expr, b: &Expr, new: &Value, old: &Value, f: fn(f64, f64) -> f64) -> Value {
-    match (eval_ro_expr(a, new, old).as_f64(), eval_ro_expr(b, new, old).as_f64()) {
+    match (
+        eval_ro_expr(a, new, old).as_f64(),
+        eval_ro_expr(b, new, old).as_f64(),
+    ) {
         (Some(x), Some(y)) => Value::Float(f(x, y)),
         _ => Value::Null,
     }
@@ -518,9 +730,11 @@ fn eval_reaction_cond(cond: &Cond, new: &Value, old: &Value) -> bool {
         Cond::Changed => !ro_val_eq(new, old),
         Cond::Became(v) => ro_val_eq(new, v) && !ro_val_eq(old, v),
         Cond::Crossed(t, dir) => {
-            let (Some(t), Some(o), Some(n)) =
-                (eval_ro_expr(t, new, old).as_f64(), old.as_f64(), new.as_f64())
-            else {
+            let (Some(t), Some(o), Some(n)) = (
+                eval_ro_expr(t, new, old).as_f64(),
+                old.as_f64(),
+                new.as_f64(),
+            ) else {
                 return false;
             };
             match dir {

@@ -5,7 +5,7 @@
 //! - 快照读：读任何字段读到的都是上一帧已提交的值
 //! - 内部是任意图灵完备代码（[`crate::runtime::Tier::Kernel`] 档自愿受限，C1）
 
-use crate::entity::{EntityTypeId, FieldId, InstanceId};
+use crate::entity::{EntityTypeId, FIELD_ALIVE, FieldId, InstanceId};
 use crate::runtime::Detect;
 use crate::value::Value;
 
@@ -114,6 +114,9 @@ impl<'rt> Ctx<'rt> {
     /// 写自己实例的字段。同一字段多次赋值由 runtime 折叠为一条写记录：
     /// new 取最终值，old 取上一帧提交值（§2 写折叠）。
     pub fn write(&mut self, field: FieldId, value: impl Into<Value>) {
+        if field == FIELD_ALIVE {
+            panic!("_alive 是 runtime 生命周期位；calculation 请使用 destroy_self()");
+        }
         self.writes.push((field, value.into()));
     }
 
@@ -136,7 +139,7 @@ impl<'rt> Ctx<'rt> {
     /// 自决（销毁的唯一入口，§6.3）。等价于 `write(_alive, false)`。
     /// 「杀死他人」必须经由数据流请求（§7 示例 2）。
     pub fn destroy_self(&mut self) {
-        self.writes.push((crate::entity::FIELD_ALIVE, Value::Bool(false)));
+        self.writes.push((FIELD_ALIVE, Value::Bool(false)));
     }
 }
 

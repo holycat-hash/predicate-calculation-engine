@@ -12,20 +12,32 @@
 
 use crate::value::Value;
 
-/// 插值种类（Cr1，每 tracked 字段二选一/三选一）。
+/// 插值种类（Cr1，每 tracked 字段按量纲选）。错配（如对 [`Value::Quat`] 用
+/// [`Interp::Lerp`]）一律退化为 `Snap`（取 cur），不报错——视觉量容错。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interp {
-    /// 直接取当前 sim 帧值，不插值。离散量（精灵帧、朝向枚举）与默认选择。
+    /// 直接取当前 sim 帧值，不插值。离散量（精灵帧、朝向枚举、handle）与默认选择。
     Snap,
-    /// 线性插值 `prev + (cur - prev) * alpha`。位置、缩放等连续数值量。
+    /// 标量线性插值 `prev + (cur - prev) * alpha`。单数值量（hp 条、单轴位移）。
     Lerp,
     /// 阶跃：alpha < 1 取 prev，alpha = 1 取 cur。布尔 / 不可中间态的量。
     Step,
+    /// 三维向量分量线性插值（[`Value::Vec3`]）。平移、缩放。
+    Vec3Lerp,
+    /// 单位四元数球面线性插值（[`Value::Quat`]）。方向 / 旋转——分量 lerp 会变速
+    /// 且离开单位球（角速度不均、缩放瑕疵），slerp 沿测地线匀速且保单位长。
+    /// 取最短弧（必要时翻号，q 与 −q 同一旋转）；近平行退化为 nlerp（数值稳）。
+    Slerp,
 }
 
 impl Interp {
-    /// 按 alpha 在 (prev, cur) 上求值。非数值量一律退化为 `Snap`（取 cur）。
+    /// 按 alpha 在 (prev, cur) 上求值。量纲错配一律退化为 `Snap`（取 cur）。
     pub fn sample(self, prev: &Value, cur: &Value, alpha: f64) -> Value {
+        let alpha = if alpha.is_finite() {
+            alpha.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         match self {
             Interp::Snap => cur.clone(),
             Interp::Step => {
@@ -40,7 +52,70 @@ impl Interp {
                 // 非数值无中间态：退化为 Snap，不报错（视觉量容错）。
                 _ => cur.clone(),
             },
+            Interp::Vec3Lerp => match (prev.as_vec3(), cur.as_vec3()) {
+                (Some(p), Some(c)) => Value::Vec3([
+                    p[0] + (c[0] - p[0]) * alpha,
+                    p[1] + (c[1] - p[1]) * alpha,
+                    p[2] + (c[2] - p[2]) * alpha,
+                ]),
+                _ => cur.clone(),
+            },
+            Interp::Slerp => match (prev.as_quat(), cur.as_quat()) {
+                (Some(p), Some(c)) => Value::Quat(slerp(p, c, alpha)),
+                _ => cur.clone(),
+            },
         }
+    }
+}
+
+/// 单位四元数球面线性插值，取最短弧。输入会先归一化，故非单位写入不会污染
+/// 最短弧判定或输出长度；病态输入退化为可用端点 / identity。
+/// near-parallel（`|dot|>0.9995`）退化为归一化线性插值——此处 `sinθ→0`，
+/// slerp 公式数值不稳，nlerp 误差可忽略。
+fn slerp(p: [f64; 4], c: [f64; 4], t: f64) -> [f64; 4] {
+    let Some(p) = normalize(p) else {
+        return normalize(c).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    };
+    let Some(mut c) = normalize(c) else {
+        return p;
+    };
+    let mut dot = p[0] * c[0] + p[1] * c[1] + p[2] * c[2] + p[3] * c[3];
+    // 最短弧：dot<0 说明走的是长弧，翻号 c（q 与 −q 表同一旋转）。
+    if dot < 0.0 {
+        c = [-c[0], -c[1], -c[2], -c[3]];
+        dot = -dot;
+    }
+    if dot > 0.9995 {
+        return normalize([
+            p[0] + (c[0] - p[0]) * t,
+            p[1] + (c[1] - p[1]) * t,
+            p[2] + (c[2] - p[2]) * t,
+            p[3] + (c[3] - p[3]) * t,
+        ])
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    }
+    let theta_0 = dot.clamp(-1.0, 1.0).acos();
+    let sin_0 = theta_0.sin();
+    let s0 = ((1.0 - t) * theta_0).sin() / sin_0;
+    let s1 = (t * theta_0).sin() / sin_0;
+    [
+        p[0] * s0 + c[0] * s1,
+        p[1] * s0 + c[1] * s1,
+        p[2] * s0 + c[2] * s1,
+        p[3] * s0 + c[3] * s1,
+    ]
+}
+
+/// 四元数归一化；零长度或非有限输入返回 None，由调用方选择容错端点。
+fn normalize(q: [f64; 4]) -> Option<[f64; 4]> {
+    if q.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if len < 1e-12 {
+        None
+    } else {
+        Some([q[0] / len, q[1] / len, q[2] / len, q[3] / len])
     }
 }
 

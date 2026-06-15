@@ -379,3 +379,58 @@ fn render_d1_collision_and_duplicate_writes_error() {
     // rg 既然注册失败，应仍可被后续合法注册者占有（无幽灵归属）。
     assert!(rr.continuous("d", unit, &[rg], Box::new(|_| {})).is_ok(), "失败注册不留脏归属");
 }
+
+#[test]
+#[should_panic(expected = "折叠序未定义")]
+fn render_detect_strict_panics_on_conflicting_fold() {
+    // 新增能力（与 sim C5 Detect 对齐）：同一 render calc 一次运行对同字段写不同值，
+    // Strict 档 panic——render 不再独有「永远静默 last-wins」的弱策略。
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![FieldDef::new("x", Value::Int(0))], false);
+    rt.enable_render_feed();
+    let mut rr = RenderRuntime::new(&rt);
+    rr.set_detect(pce::Detect::Strict);
+    let rf = rr.add_render_field(unit, Value::Int(0));
+    rr.continuous(
+        "conflict",
+        unit,
+        &[rf],
+        Box::new(move |ctx| {
+            ctx.write(rf, 1);
+            ctx.write(rf, 2); // 同字段写不同值 → Strict 应 panic
+        }),
+    )
+    .unwrap();
+    let publisher = Publisher::new(rr.tracked_fields());
+    let _u = rt.spawn(unit, vec![]);
+    rt.step();
+    publisher.publish(&rt, 1);
+    rr.sync(&publisher, 0.016, 0.5); // render_frame 跑 continuous → 折叠冲突 panic
+}
+
+#[test]
+fn render_detect_silent_folds_last_wins() {
+    // Silent 档（与 sim 同纪律）：同字段多写不同值静默折叠为 last-wins，不 panic。
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![FieldDef::new("x", Value::Int(0))], false);
+    rt.enable_render_feed();
+    let mut rr = RenderRuntime::new(&rt);
+    rr.set_detect(pce::Detect::Silent);
+    let rf = rr.add_render_field(unit, Value::Int(0));
+    rr.continuous(
+        "conflict",
+        unit,
+        &[rf],
+        Box::new(move |ctx| {
+            ctx.write(rf, 1);
+            ctx.write(rf, 2);
+        }),
+    )
+    .unwrap();
+    let publisher = Publisher::new(rr.tracked_fields());
+    let u = rt.spawn(unit, vec![]);
+    rt.step();
+    publisher.publish(&rt, 1);
+    rr.sync(&publisher, 0.016, 0.5);
+    assert_eq!(rr.read(u, rf), Value::Int(2), "Silent 折叠为 last-wins=2");
+}

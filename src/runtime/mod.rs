@@ -31,6 +31,8 @@ mod route;
 mod store;
 
 pub use store::{RowPolicy, Store};
+/// render 复用 sim 的谓词求值器 / 投影（条件评估单一真源，render 不再 fork）。
+pub(crate) use route::{project_ro, CompiledCond};
 
 use std::collections::{HashMap, HashSet};
 
@@ -754,12 +756,21 @@ impl Runtime {
             self.profile.trigger_counts[t.calc.0 as usize] += 1;
         }
         // C1/C2/C3 上游集成：按 calc 分组（kernel 批 / 读集局部性的结构前提），
-        // 物化本帧执行计划并解析驻留（C3，含 Auto 的 profile 建议）。跨 calc 重排
-        // 合法（D1 写集互斥 → 任意序等价）；同 calc 多 each 的折叠序本就 undefined。
+        // 物化本帧执行计划并解析驻留（C3，含 Auto 的 profile 建议）。
+        //
+        // 重排的合法性是 *store-scoped* 的，并依赖 calc 副作用受限（effect-confinement）：
+        //   D1（写集互斥）+ 写局部 + 快照读 + calc 无 ctx 外副作用
+        //   ⇒ 提交 store 的持久 cell 字段值与触发序无关；
+        //      新生实体身份仅在固定调度（Canonical）下与序无关，Free 下至多差一个 id 置换
+        //      （spawn 按触发序分配 id，重排即重排 id 赋予）。
+        // 跨 calc 写不同 cell（D1）⇒ 折叠互不影响；同 calc 同 cell 由稳定排序保相对序。
+        // 不变量不覆盖闭包的 ambient 副作用（log/RNG/static）——那在 store 之外，由
+        // effect-confinement 假设排除（execution 层为不透明 Box<dyn Fn>，本实现只能假设、
+        // 不能机检；补 kernel-IR seam 后可升级为保证）。
         triggers.sort_by_key(|t| t.calc.0);
         self.schedule = self.build_schedule(&triggers);
-        // 阶段二：执行。零序约束（快照读 + D1 + 写局部）：帧内任何调度语义等价。
-        // 写落本地缓冲、帧界提交——无原子、无伪共享。
+        // 阶段二：执行。零序约束（快照读 + D1 + 写局部 + effect-confinement）：帧内任何
+        // 调度对提交 store 语义等价（精确命题见上）。写落本地缓冲、帧界提交——无原子、无伪共享。
         let (exec_buf, spawns) =
             run_triggers(&self.store, &self.calcs, self.detect, self.frame, &triggers);
         self.spawn_queue.extend(spawns);
@@ -958,10 +969,12 @@ fn run_one(
 
 /// 执行全部触发并做写折叠。
 ///
-/// 零序约束（白送优化）：快照读 + D1 + 写局部 ⇒ 帧内任何调度语义等价；
+/// 零序约束（白送优化）：快照读 + D1 + 写局部 + effect-confinement ⇒ 帧内任何调度对
+/// 提交 store 语义等价（持久 cell 字段值；spawn 身份在 Free 下至多差 id 置换）。
 /// 唯一例外（同实例多次 each 的折叠序）已被宣布 undefined。
-/// `parallel` feature 下按触发并行（rayon），各触发写本地缓冲（无原子、
-/// 无伪共享），折叠按触发序归并——并行调度不引入额外不确定性。
+/// `parallel` feature 下按触发并行（rayon），各触发写本地缓冲（无原子、无伪共享），
+/// 折叠按触发序归并——故同一触发数组下提交 store 确定，并行不引入额外不确定性
+///（前提同上：闭包无 ctx 外副作用；ambient 副作用不在本不变量范围内）。
 fn run_triggers(
     store: &Store,
     calcs: &[RegisteredCalc],

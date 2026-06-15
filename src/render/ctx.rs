@@ -14,15 +14,15 @@ use crate::value::Value;
 use super::clock::RenderClock;
 use super::store::{RFieldId, RenderStore};
 
-/// 谓词交付给 render reaction 的输入（continuous 无投影，见 [`RenderInput::Tick`]）。
+/// 谓词交付给 render reaction 的输入。只镜像 render 真实支持的两种交付势
+/// （each / batch）；continuous 不经此通道——它由 render clock 直驱，读 [`RenderCtx`]
+/// 的时钟、无投影输入（故无 `Tick` 势：那曾是从未被构造的死变体）。
 #[derive(Debug, Clone)]
 pub enum RenderInput {
     /// each：一条命中的投影元组（sim 写的快照投影）。
     Each(Vec<Value>),
     /// batch：整 sim 帧命中的多重集（顺序未定义，D3）。
     Batch(Vec<Vec<Value>>),
-    /// continuous：render clock tick，无投影。
-    Tick,
 }
 
 impl RenderInput {

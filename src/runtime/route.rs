@@ -751,6 +751,20 @@ pub(crate) fn project(projs: &[Proj], w: &WriteRec, sub: InstanceId, store: &Sto
         .collect()
 }
 
+/// 只读投影（render 反应复用此入口）：projs 保证不含 `Own`（注册期裁定），
+/// 故无需订阅者行 / store。与 [`project`] 的 new/old/writer 臂逐字同义。
+pub(crate) fn project_ro(projs: &[Proj], w: &WriteRec) -> Vec<Value> {
+    projs
+        .iter()
+        .map(|p| match p {
+            Proj::New(path) => w.new.get_path(path),
+            Proj::Old(path) => w.old.get_path(path),
+            Proj::WriterId => Value::Ref(w.inst),
+            Proj::Own(_) => unreachable!("render 投影不含 own（注册期裁定）"),
+        })
+        .collect()
+}
+
 // ---- 条件求值（§3.3 封闭集：new / old / own 字段 / 常量含 self）----
 //
 // 谓词预编译（白送优化）：注册期把 `Cond`/`Expr` AST 降为一段扁平后缀程序
@@ -795,16 +809,40 @@ impl CompiledCond {
         CompiledCond { ops }
     }
 
-    /// 求值。`stack` 是 route 帧内复用的值栈（零分配）。
+    /// 求值（sim：含 own/self 点查）。`stack` 是 route 帧内复用的值栈（零分配）。
     fn eval(&self, c: &EvalCtx, stack: &mut Vec<Value>) -> bool {
+        self.run(c.new, c.old, Some((c.store, c.sub)), stack)
+    }
+
+    /// 只读求值（render 反应复用此入口）：条件保证不含 own/self（注册期裁定），
+    /// 故无需 store / 订阅者。同一份后缀程序、同一份语义——render 不再 fork 求值器。
+    pub(crate) fn eval_ro(&self, new: &Value, old: &Value, stack: &mut Vec<Value>) -> bool {
+        self.run(new, old, None, stack)
+    }
+
+    /// 后缀程序求值内核。`sub = Some((store, 订阅者))` 时支持 own/self 点查（sim）；
+    /// `None`（render 只读条件）时 Own/SelfRef 不可达——注册期已裁定其不出现。
+    fn run(
+        &self,
+        new: &Value,
+        old: &Value,
+        sub: Option<(&Store, InstanceId)>,
+        stack: &mut Vec<Value>,
+    ) -> bool {
         stack.clear();
         for op in &self.ops {
             match op {
-                COp::New(p) => stack.push(c.new.get_path(p)),
-                COp::Old(p) => stack.push(c.old.get_path(p)),
-                COp::Own(f) => stack.push(c.store.read(c.sub, *f)),
+                COp::New(p) => stack.push(new.get_path(p)),
+                COp::Old(p) => stack.push(old.get_path(p)),
+                COp::Own(f) => {
+                    let (store, s) = sub.expect("own 出现在只读条件中（注册期应已裁定）");
+                    stack.push(store.read(s, *f));
+                }
                 COp::Const(v) => stack.push(v.clone()),
-                COp::SelfRef => stack.push(Value::Ref(c.sub)),
+                COp::SelfRef => {
+                    let (_, s) = sub.expect("self 出现在只读条件中（注册期应已裁定）");
+                    stack.push(Value::Ref(s));
+                }
                 COp::Add => bin_arith(stack, |x, y| x + y),
                 COp::Sub => bin_arith(stack, |x, y| x - y),
                 COp::Mul => bin_arith(stack, |x, y| x * y),
@@ -815,22 +853,22 @@ impl CompiledCond {
                     stack.push(Value::Bool(cmp_op(&l, *op, &r)));
                 }
                 COp::InRange(a, b) => {
-                    let hit = c.new.as_f64().is_some_and(|v| v >= *a && v <= *b);
+                    let hit = new.as_f64().is_some_and(|v| v >= *a && v <= *b);
                     stack.push(Value::Bool(hit));
                 }
                 COp::InSet(vs) => {
-                    let hit = vs.iter().any(|v| val_eq(v, c.new));
+                    let hit = vs.iter().any(|v| val_eq(v, new));
                     stack.push(Value::Bool(hit));
                 }
                 // D2 写即事件；「值真的变了」显式问
-                COp::Changed => stack.push(Value::Bool(!val_eq(c.new, c.old))),
+                COp::Changed => stack.push(Value::Bool(!val_eq(new, old))),
                 COp::Became(v) => {
-                    stack.push(Value::Bool(val_eq(c.new, v) && !val_eq(c.old, v)));
+                    stack.push(Value::Bool(val_eq(new, v) && !val_eq(old, v)));
                 }
                 // 边沿穿越（双缓冲旧值免费，O(1)，§4）
                 COp::Crossed(dir) => {
                     let t = stack.pop().unwrap_or(Value::Null);
-                    let hit = match (t.as_f64(), c.old.as_f64(), c.new.as_f64()) {
+                    let hit = match (t.as_f64(), old.as_f64(), new.as_f64()) {
                         (Some(t), Some(old), Some(new)) => match dir {
                             Dir::Down => old >= t && new < t,
                             Dir::Up => old <= t && new > t,

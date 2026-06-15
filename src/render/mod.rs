@@ -46,16 +46,17 @@ use std::collections::{HashMap, HashSet};
 
 use crate::entity::{EntityTypeId, FieldId, InstanceId};
 use crate::predicate::{Cond, Expr, Proj, ValRef};
-use crate::runtime::Runtime;
+use crate::runtime::{project_ro, CompiledCond, Detect, Runtime};
 use crate::value::Value;
 
 struct Reaction {
-    #[allow(dead_code)]
+    /// D1 / C5 检测消息里用作 owner 名。
     name: String,
     /// scope：`type(ty, sim_field)`。v1 订阅者 = writer 本身。
     ty: EntityTypeId,
     sim_field: FieldId,
-    cond: Cond,
+    /// 预编译条件：复用 sim 的 [`CompiledCond`]（同一份扁平后缀求值器，走 `eval_ro`）。
+    compiled: CompiledCond,
     projs: Vec<Proj>,
     batched: bool,
     writes: HashSet<RFieldId>,
@@ -63,7 +64,7 @@ struct Reaction {
 }
 
 struct Continuous {
-    #[allow(dead_code)]
+    /// D1 / C5 检测消息里用作 owner 名。
     name: String,
     ty: EntityTypeId,
     writes: HashSet<RFieldId>,
@@ -83,6 +84,9 @@ pub struct RenderRuntime {
     continuous: Vec<Continuous>,
     /// render 侧 D1：(类型, render 字段) → 归属者描述（注册期冲突即错）。
     field_owner: HashMap<(EntityTypeId, RFieldId), String>,
+    /// C5 检测档位（与 sim 同一 [`Detect`]）：管「同 calc 多次运行对同 render 字段写
+    /// 不同值」的折叠序未定义告警。默认跟随构建档（debug→Warn / release→Silent）。
+    detect: Detect,
     clock: RenderClock,
     /// 已摄入的最新 sim 帧号（去重：同一 SimFrame 跨多个 render 帧只摄入一次）。
     last_ingested: u64,
@@ -118,6 +122,7 @@ impl RenderRuntime {
             reactions: vec![],
             continuous: vec![],
             field_owner: HashMap::new(),
+            detect: Detect::default(),
             clock: RenderClock::new(),
             last_ingested: 0,
             active: vec![],
@@ -125,6 +130,12 @@ impl RenderRuntime {
             death_fade: HashMap::new(),
             dying: vec![],
         }
+    }
+
+    /// C5 检测档位（默认跟随构建档）。与 sim 的 [`Runtime::set_detect`] 对偶——令 render
+    /// 的 D1 折叠冲突在 QA 下可 Strict panic，而非静默 last-wins。
+    pub fn set_detect(&mut self, d: Detect) {
+        self.detect = d;
     }
 
     // ---- 注册期 ----
@@ -183,11 +194,14 @@ impl RenderRuntime {
         validate_reaction_cond(&cond)?;
         validate_reaction_projs(&projs)?;
         self.claim_writes(ty, writes, name)?;
+        // 复用 sim 的预编译条件：render 反应条件是 `Cond` 的只读子集（无 own/self），
+        // 编成同一份扁平后缀程序，运行期走 `eval_ro`——render 不再 fork 求值器。
+        let compiled = CompiledCond::compile(&cond);
         self.reactions.push(Reaction {
             name: name.to_string(),
             ty,
             sim_field,
-            cond,
+            compiled,
             projs,
             batched,
             writes: writes.iter().copied().collect(),
@@ -478,8 +492,10 @@ impl RenderRuntime {
     }
 
     fn run_continuous(&mut self) {
+        let detect = self.detect;
         for ci in 0..self.continuous.len() {
             let ty = self.continuous[ci].ty;
+            let name = self.continuous[ci].name.clone();
             let declared = self.continuous[ci].writes.clone();
             let mut insts = vec![];
             self.store.for_each_live(ty, |i| insts.push(i));
@@ -494,25 +510,31 @@ impl RenderRuntime {
                     (self.continuous[ci].f)(&mut ctx);
                     ctx.writes
                 };
-                commit_writes(&mut self.store, inst, &declared, writes);
+                commit_writes(&mut self.store, inst, &declared, &name, detect, writes);
             }
         }
     }
 
     fn run_reactions(&mut self, sf: &SimFrame) {
+        let detect = self.detect;
         for ri in 0..self.reactions.len() {
             let ty = self.reactions[ri].ty;
             let sim_field = self.reactions[ri].sim_field;
             let batched = self.reactions[ri].batched;
+            let name = self.reactions[ri].name.clone();
             let declared = self.reactions[ri].writes.clone();
-            // 收集命中（先收集再运行，避开借用交叠）。
+            // 收集命中（先收集再运行，避开借用交叠）。条件复用 sim 预编译求值器
+            // （`eval_ro`），投影复用 `project_ro`——render 不再持有自己的副本。
+            let mut eval_stack: Vec<Value> = vec![];
             let mut hits: Vec<(InstanceId, Vec<Value>)> = vec![];
             for rec in &sf.events {
                 if rec.inst.ty == ty
                     && rec.field == sim_field
-                    && eval_reaction_cond(&self.reactions[ri].cond, &rec.new, &rec.old)
+                    && self.reactions[ri]
+                        .compiled
+                        .eval_ro(&rec.new, &rec.old, &mut eval_stack)
                 {
-                    hits.push((rec.inst, project_reaction(&self.reactions[ri].projs, rec)));
+                    hits.push((rec.inst, project_ro(&self.reactions[ri].projs, rec)));
                 }
             }
             if batched {
@@ -540,7 +562,7 @@ impl RenderRuntime {
                         (self.reactions[ri].f)(&mut ctx, &RenderInput::Batch(rows));
                         ctx.writes
                     };
-                    commit_writes(&mut self.store, inst, &declared, writes);
+                    commit_writes(&mut self.store, inst, &declared, &name, detect, writes);
                 }
             } else {
                 for (inst, row) in hits {
@@ -557,7 +579,7 @@ impl RenderRuntime {
                         (self.reactions[ri].f)(&mut ctx, &RenderInput::Each(row));
                         ctx.writes
                     };
-                    commit_writes(&mut self.store, inst, &declared, writes);
+                    commit_writes(&mut self.store, inst, &declared, &name, detect, writes);
                 }
             }
         }
@@ -613,10 +635,15 @@ fn render_binding_fields(binding: &RenderBinding) -> [(&'static str, Option<RFie
 }
 
 /// 写折叠（render 侧）：同 calc 一次运行对同 render 字段的多次写取最终值；D1 校验。
+/// 检测纪律与 sim `run_triggers` 一致：未声明写恒 panic（D1 render 侧）；同字段多写
+/// 不同值按 C5 [`Detect`] 档告警（Strict panic / Warn eprintln / Silent 静默折叠）
+/// ——render 不再独有「永远静默 last-wins」的弱策略。
 fn commit_writes(
     store: &mut RenderStore,
     inst: InstanceId,
     declared: &HashSet<RFieldId>,
+    owner: &str,
+    detect: Detect,
     writes: Vec<(RFieldId, Value)>,
 ) {
     let mut folded: Vec<(RFieldId, Value)> = vec![];
@@ -624,10 +651,21 @@ fn commit_writes(
         // 硬断言（与 sim 引擎 run_triggers 同纪律）：未声明写破坏 D1 render 侧。
         assert!(
             declared.contains(&f),
-            "render calc 写了未声明的 render 字段 {}（D1 render 侧要求静态写集）",
+            "render calc {owner} 写了未声明的 render 字段 {}（D1 render 侧要求静态写集）",
             f.0
         );
         if let Some(slot) = folded.iter_mut().find(|(ff, _)| *ff == f) {
+            // C5 检测：同 calc 多次运行对同字段写不同值，折叠序未定义（与 sim 同纪律）。
+            if slot.1 != v && detect != Detect::Silent {
+                let msg = format!(
+                    "[PCE-render] {owner} 多次运行对同 render 字段 {} 写入不同值，折叠序未定义",
+                    f.0
+                );
+                if detect == Detect::Strict {
+                    panic!("{msg}");
+                }
+                eprintln!("{msg}");
+            }
             slot.1 = v;
         } else {
             folded.push((f, v));
@@ -638,7 +676,7 @@ fn commit_writes(
     }
 }
 
-// ---- 反应条件 / 投影（v1 子集：new / old / 常量）----
+// ---- 反应条件 / 投影准入校验（v1 子集：new / old / 常量；求值复用 route 的预编译器）----
 
 fn validate_reaction_cond(c: &Cond) -> Result<(), String> {
     fn expr_ok(e: &Expr) -> bool {
@@ -673,89 +711,6 @@ fn validate_reaction_projs(projs: &[Proj]) -> Result<(), String> {
     Ok(())
 }
 
-fn eval_ro_expr(e: &Expr, new: &Value, old: &Value) -> Value {
-    match e {
-        Expr::Val(ValRef::New(p)) => new.get_path(p),
-        Expr::Val(ValRef::Old(p)) => old.get_path(p),
-        Expr::Val(ValRef::Const(v)) => v.clone(),
-        Expr::Val(_) => Value::Null,
-        Expr::Add(a, b) => ro_arith(a, b, new, old, |x, y| x + y),
-        Expr::Sub(a, b) => ro_arith(a, b, new, old, |x, y| x - y),
-        Expr::Mul(a, b) => ro_arith(a, b, new, old, |x, y| x * y),
-        Expr::Div(a, b) => ro_arith(a, b, new, old, |x, y| x / y),
-    }
-}
-
-fn ro_arith(a: &Expr, b: &Expr, new: &Value, old: &Value, f: fn(f64, f64) -> f64) -> Value {
-    match (
-        eval_ro_expr(a, new, old).as_f64(),
-        eval_ro_expr(b, new, old).as_f64(),
-    ) {
-        (Some(x), Some(y)) => Value::Float(f(x, y)),
-        _ => Value::Null,
-    }
-}
-
-fn ro_val_eq(a: &Value, b: &Value) -> bool {
-    match (a.as_f64(), b.as_f64()) {
-        (Some(x), Some(y)) => x == y,
-        _ => a == b,
-    }
-}
-
-/// 反应条件求值（new/old/常量子集；与 route.rs 的 eval_cond 同义，去掉 own/self）。
-fn eval_reaction_cond(cond: &Cond, new: &Value, old: &Value) -> bool {
-    use crate::predicate::{CmpOp, Dir};
-    match cond {
-        Cond::True => true,
-        Cond::Cmp(l, op, r) => {
-            let (lv, rv) = (eval_ro_expr(l, new, old), eval_ro_expr(r, new, old));
-            match op {
-                CmpOp::Eq => ro_val_eq(&lv, &rv),
-                CmpOp::Ne => !ro_val_eq(&lv, &rv),
-                _ => match lv.cmp_num(&rv) {
-                    Some(o) => match op {
-                        CmpOp::Lt => o.is_lt(),
-                        CmpOp::Le => o.is_le(),
-                        CmpOp::Gt => o.is_gt(),
-                        CmpOp::Ge => o.is_ge(),
-                        _ => unreachable!(),
-                    },
-                    None => false,
-                },
-            }
-        }
-        Cond::InRange(a, b) => new.as_f64().is_some_and(|v| v >= *a && v <= *b),
-        Cond::InSet(vs) => vs.iter().any(|v| ro_val_eq(v, new)),
-        Cond::Changed => !ro_val_eq(new, old),
-        Cond::Became(v) => ro_val_eq(new, v) && !ro_val_eq(old, v),
-        Cond::Crossed(t, dir) => {
-            let (Some(t), Some(o), Some(n)) = (
-                eval_ro_expr(t, new, old).as_f64(),
-                old.as_f64(),
-                new.as_f64(),
-            ) else {
-                return false;
-            };
-            match dir {
-                Dir::Down => o >= t && n < t,
-                Dir::Up => o <= t && n > t,
-            }
-        }
-        Cond::And(a, b) => eval_reaction_cond(a, new, old) && eval_reaction_cond(b, new, old),
-        Cond::Or(a, b) => eval_reaction_cond(a, new, old) || eval_reaction_cond(b, new, old),
-        Cond::AndNot(a, b) => eval_reaction_cond(a, new, old) && !eval_reaction_cond(b, new, old),
-    }
-}
-
-fn project_reaction(projs: &[Proj], rec: &crate::runtime::WriteRec) -> Vec<Value> {
-    projs
-        .iter()
-        .map(|p| match p {
-            Proj::New(path) => rec.new.get_path(path),
-            Proj::Old(path) => rec.old.get_path(path),
-            Proj::WriterId => Value::Ref(rec.inst),
-            Proj::Own(_) => Value::Null, // 注册期已挡
-        })
-        .collect()
-}
+// 反应条件求值 / 投影现复用 sim 的预编译器（[`CompiledCond::eval_ro`] / [`project_ro`]）：
+// render 条件是 `Cond` 的只读子集（无 own/self，上面 validate_* 注册期保证），故能直接
+// 走同一份扁平后缀程序，不再维护第二份树游走求值器与投影器（条件语义单一真源）。

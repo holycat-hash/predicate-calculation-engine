@@ -3,7 +3,7 @@
 **Language:** English | [中文](README-zh.md)
 
 A pure data-driven predicate calculation engine implemented in Rust, aimed at high-frequency frame-driven domains such as game logic.
-The system has exactly four abstraction layers: **runtime / entity / calculation / predicate**. Every new requirement must be folded into these four layers. There is no fifth concept: no messages, no event bus, no callbacks, and no global functions.
+The **simulation core has exactly four abstraction layers: runtime / entity / calculation / predicate**. Every business requirement must be folded into these four layers. There is no fifth concept: no messages, no event bus, no callbacks, and no global functions. Above the core there are two derived constructs that reuse the same four-layer closure and are not new concepts: the **derived consumer runtime** (`render`, a second runtime that consumes the sim write stream one-way) and the **materialized-index helper** (`spatial`).
 
 The only trigger source is "writes from the previous frame." Polling, messages, and events are all unified as writes to a cell, where a **cell** is one field of one entity instance.
 
@@ -16,11 +16,12 @@ The only trigger source is "writes from the previous frame." Polling, messages, 
 | **calculation** | Turing-complete business code; input is the delivery from the preceding predicate as value snapshots, and output may only write fields on its own instance |
 | **predicate** | A declaration-shaped triple `(scope, condition, delivery)` fixed at registration time; closed algebra, compilable, and indexable |
 
-Three pinned decisions:
+Four pinned decisions:
 
-- **D1 Single writer**: every field statically belongs to exactly one calculation. Conflicts are rejected at registration.
+- **D1 Single writer**: every cell statically belongs to exactly one writer: a calculation, a built-in runtime writer, or a render extension writer. Conflicts are rejected at registration.
 - **D2 Writes are events**: every write produces an event, even if the value does not change. Real value changes are expressed explicitly with `changed`.
 - **D3 Batches are unordered**: batch delivery order is undefined. Consumers must be order-independent and treat input as a multiset.
+- **D4 Effect confinement**: a calculation closure's only observable effects go through `ctx`; there are no ambient side effects outside `ctx`. Together with write locality, this is what makes free reordering and execution-stage parallelism legal.
 
 These constraints buy snapshot reads, parallel execution without data races, feedback loops that naturally unfold as frame-to-frame ping-pong, and the **cost invariant**: total per-frame scheduling cost is `O(|W|*log + |F|)`, independent of the total number of predicates, instances, or cells.
 
@@ -36,7 +37,7 @@ pce = { path = "../predicate-calculation-engine" }
 # pce = { path = "...", features = ["parallel"] }
 ```
 
-The crate entry point exposes only the four core layers: `runtime` / `entity` / `calculation` / `predicate`.
+The crate entry point exposes the four core layers (`runtime` / `entity` / `calculation` / `predicate`) plus the derived consumer runtime (`render`) and the materialized-index helper (`spatial`).
 The earlier Rust API shape that closely mirrored the documentation DSL has moved to [docs-zh/original-api-shape.rs](docs-zh/original-api-shape.rs) as a teaching reference only; it is no longer exported as a module and is not compiled into the library.
 
 ## Example
@@ -125,7 +126,7 @@ cargo test --features parallel    # The same test set with rayon-backed executio
 
 ```text
 src/
-  lib.rs             # Crate entry point, four-layer exports, optimization-tier overview
+  lib.rs             # Crate entry point, four-layer core + derived runtime / helper exports
   entity.rs          # Entity types, instances, fields, and cell addresses
   predicate.rs       # Predicate algebra: scope / condition / delivery
   calculation.rs     # Calculation execution context, C1/C2 detection-aware
@@ -135,9 +136,11 @@ src/
     store.rs         # SoA column storage and row identity policy (C6)
     route.rs         # Routing indexes: value buckets, threshold tables, equivalence merge, fold
     clock.rs         # Clock and alarm timer-wheel surface
+  render/            # Derived consumer runtime: dynamic frame rate, consumes sim writes one-way
+  spatial.rs         # Materialized-index helper: uniform grid for the Section 6.1 pattern
 examples/demo.rs     # Complete pure-library core API example
 docs/
-  PCE.md             # Architecture guide
+  PCE.md             # Architecture guide: invariants, derived runtime, and cost model
   README.md          # Scenario-method index
   01..23-*.md        # Scenario documents
 docs-zh/
@@ -156,7 +159,7 @@ tests/               # Scenario tests plus core API / optimization behavior
 
 ## Test Coverage
 
-The 23 scenario documents under `docs/01..23-*.md` and `docs-zh/01..23-*.md` have corresponding Rust integration tests under `tests/`. Each test file validates the key decomposition, invariants, and D1/D2/D3 constraints from its scenario.
+The 23 scenario documents under `docs/01..23-*.md` and `docs-zh/01..23-*.md` have corresponding Rust integration tests under `tests/`. Each test file validates the key decomposition, invariants, and D1-D4 constraints from its scenario.
 
 ```powershell
 cargo test

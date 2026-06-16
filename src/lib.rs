@@ -1,10 +1,13 @@
 //! PredicateCalculationEngine (PCE)
 //!
-//! 四层抽象：runtime / entity / calculation / predicate（见 docs-zh/PCE文档.md）。
-//! 任何新需求必须折叠进这四层，禁止引入第五种概念。
+//! simulation core 四层抽象：runtime / entity / calculation / predicate（见 docs-zh/PCE文档.md）。
+//! 任何业务需求必须折叠进这四层，禁止引入第五种概念。core 之上有两类派生物
+//! （复用四层、非新概念）：[`render`] 派生消费者 runtime（第二个 runtime，单向消费 sim 写流）
+//! 与 [`spatial`] 物化索引 helper（§6.1 模式的随附工具）。
 //!
 //! - 唯一触发源：上一帧的 write（D2 写即事件）
-//! - 单写者制（D1）：字段静态归属唯一 calculation，注册期检查
+//! - 单 writer 制（D1）：cell 静态归属唯一 writer（calculation / runtime 内建 / render extension 三类），注册期检查
+//! - 副作用封闭（D4）：calculation 无 ctx 外 ambient 副作用——与写局部性并列，重排 / 并行的前提
 //! - 快照读：本帧写入本帧不可见（双缓冲 = 单存储 + 写日志）
 //! - 交付无序（D3）：batch 是多重集，消费逻辑必须顺序无关
 //! - 成本不变量：整帧调度 O(|W|·log + |F|)，与谓词总数、实例总数无关

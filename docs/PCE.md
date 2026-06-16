@@ -6,7 +6,9 @@
 
 ## 0. General Rules
 
-This architecture has exactly four abstraction layers: **runtime, entity, calculation, predicate**. Every new requirement must fold into these four layers. No fifth concept may be introduced. Everything that follows, including clock, lifecycle, spatial indexes, and cross-entity interaction, is a consequence of those four layers rather than an extension.
+The **simulation core** of this architecture has exactly four abstraction layers: **runtime, entity, calculation, predicate**. Every business requirement must fold into these four layers. No fifth concept may be introduced. Everything that follows, including clock, lifecycle, spatial indexes, and cross-entity interaction, is a consequence of those four layers rather than an extension.
+
+Above the core, it is still possible to build a **derived consumer runtime**. `render` (Section 9) is a second runtime that reuses the same four-layer closure and consumes the write log committed by sim in one direction. It is not a fifth concept, but it also is not part of the sim core. Keep two non-core categories distinct: derived consumer runtimes, which are independent second runtimes, and helper tools inside the four-layer pattern, such as the `spatial` materialized-index helper in Section 6.1, which remains an implementation detail of a calculation.
 
 The system is purely data-driven. The only trigger source is "writes from the previous frame." There is no polling, message system, or event bus; all of them are unified as writes to a cell. A **cell** is one field of one entity instance and is the smallest unit of data, write, and subscription.
 
@@ -14,13 +16,19 @@ The predicate layer is a closed algebra. A predicate is a declaration-shaped str
 
 ### 0.1 Decision Record
 
-**D1 Single writer**: every field statically belongs to exactly one calculation. Ownership conflicts are errors at registration time.
+**D1 Single writer**: every cell statically belongs to exactly one **writer**. Ownership conflicts are errors at registration time. There are three writer classes: calculation writers, which are sim business logic and own the write sets declared on their own instance type; built-in runtime writers, which exclusively own built-in cells such as `Clock.frame` and `Clock.alarm` and manage the `_alive` lifecycle bit; and extension writers, such as the render derived consumer runtime, which claims render namespace fields (`RFieldId`) through `claim_writes` (Section 9). The unified invariant is one cell to one writer, checked at registration time. This makes `new` unambiguous and removes arbitration from parallel execution.
 
 **D2 Writes are events**: every write produces an event, whether or not the value changes. "The value really changed" is expressed explicitly with `changed`.
 
 **D3 Batches are unordered**: batch delivery order is undefined. The runtime may deliver in any order, such as shard order or arrival order, and the routing stage performs no sorting or ordering barrier.
 
-In addition, Section 1.4's "single predicate per calculation" rule and Section 2's snapshot-read / write-folding model are fixed consequences of D1-D3 and write locality. They are important acceptance points for the design.
+**D4 Effect confinement**: a calculation closure's only observable effects occur through `ctx` (`write`, `spawn`, and `destroy_self`). The closure has no ambient side effects outside `ctx`, such as I/O, log feedback, global/static mutation, or RNG not seeded through cells.
+
+This is orthogonal to **write locality**. Write locality constrains where a calculation writes: only fields on its own instance, enforced by `Ctx::write` not accepting an instance parameter plus D1. Effect confinement constrains what else can be touched outside `ctx`: nothing. It is currently a contract, not a machine-checked guarantee, because the execution layer is an opaque `Box<dyn Fn>`; the runtime can assume it but cannot verify it until a kernel-IR seam exists.
+
+D4 is pinned because legal free reordering (D3 / cross-calculation regrouping) and execution-stage parallelism (`parallel` feature) depend on it. More precisely, D1 + write locality + snapshot reads + effect confinement imply that persistent cell values committed to the store are independent of trigger order. New entity identities are order-independent only under a fixed schedule (`Canonical`, C4); under `Free`, results may differ by an id renaming. D1-D3 provide order independence inside the store, while D4 excludes ambient effects outside the store. Without both, reordering and parallel execution are not valid.
+
+In addition, Section 1.4's "single predicate per calculation" rule and Section 2's snapshot-read / write-folding model are fixed consequences of D1-D4 and write locality. They are important acceptance points for the design.
 
 ---
 
@@ -44,7 +52,9 @@ A calculation is attached under an entity type and runs after a predicate. Its i
 
 **Write locality**: a calculation can only write its own instance fields. Cross-instance influence must travel through dataflow: write your own field, then let the other side sniff it through a predicate.
 
-**Single writer (D1)**: each field statically belongs to exactly one calculation. Registration checks this and rejects conflicts. That makes `new` unambiguous and lets execution run in parallel without arbitration.
+**Single writer (D1)**: each cell statically belongs to exactly one writer. Registration checks this and rejects conflicts. Calculation is one of the three writer classes; the other two are built-in runtime writers and render extension writers (Section 0.1). That makes `new` unambiguous and lets execution run in parallel without arbitration.
+
+**Effect confinement (D4)**: a calculation's Turing-complete code has no observable effects except through `ctx`. It is separate from write locality: write locality governs "where can this write go," while effect confinement governs "what else can this closure touch." It is also a precondition for free reordering and execution-stage parallelism (Sections 0.1 and 2).
 
 **Snapshot reads**: any field read by a calculation, including its own, is the value committed in the previous frame. Writes in the current frame are invisible to the current frame.
 
@@ -54,7 +64,7 @@ Calculation code itself may be arbitrary Turing-complete code.
 
 A predicate precedes a calculation and has the shape `(scope, condition, delivery)`, detailed in Section 3.
 
-**Single predicate per calculation**: each calculation has exactly one preceding predicate. If multiple predicates with different delivery shapes were allowed to feed one calculation, the input signature would no longer be single. Composition still has paths inside the four layers: use scope union (`|`) for "any source", conjunction (`&`) for same-frame co-occurrence, and materialize aggregates first when a trigger stream needs an aggregate value.
+**Single predicate per calculation**: each calculation has exactly one preceding predicate. If multiple predicates with different delivery shapes were allowed to feed one calculation, the input signature would no longer be single. Composition still has paths inside the four layers: use scope union (`|`) for "any source"; use conjunction (`&`, with the current limitations in Section 3.2) for same-frame co-occurrence; and materialize aggregates first when a trigger stream needs an aggregate value: put another fold predicate + calculation on the same entity, write the aggregate into a field, and let the main calculation read it through `project(own.f)` (Section 3.4).
 
 ---
 
@@ -103,6 +113,14 @@ scope := own(field)              # one cell on this same instance
 
 The `ref` used by `inst` must come from a ref-typed field on the subscriber instance.
 
+**Current limitations of conjunction `&`.** Conjunction is a same-frame co-occurrence gate. The current implementation has these boundaries:
+
+1. **Only `each` delivery**: conjunction scopes currently support only `each`. Using `batch` or `fold` with conjunction is rejected at registration time because the meaning of aggregation under same-frame gating is still undefined (Section 8).
+2. **Scope shape**: only "conjunction of disjunctions," such as `(a|b) & c`, is supported. "Disjunction of conjunctions," such as `(a&b) | c`, is rejected. For deeper nesting, materialize the intermediate value as an entity (Section 6.1).
+3. **Gate, not join**: `&` only checks that every branch wrote during the same frame. It does not join values. When the latch completes, delivery projects only the final write that completed the latch; it cannot deliver all branch values together. Association is by subscriber identity, not by a join key. Keyed association is a join and is forbidden by Section 3.3. Each subscriber can trigger at most once per frame.
+4. **Branch limit**: the conjunction latch is a `u32` bit mask, with the top bit reserved as the "already triggered this frame" flag, so the implementation limit is 31 branches.
+5. **Same-frame barrier**: `&` needs the complete frame write set and is the only pipelining barrier inside routing. Co-occurrence is strictly same-frame; there is no time window. Timeout and "silent for N frames" semantics are expressed with clock cells (Section 6.2).
+
 ### 3.3 condition
 
 Conditions may reference only a closed set: `new`, `old`, fields on the subscriber's own row, constants including `self`, and field paths inside structured cells such as `new.target`. Comparison operands may include scalar arithmetic over constants and own fields, such as `0.3 * own.hp_max`; that cost is charged to the "live threshold" line of Section 4.
@@ -133,9 +151,20 @@ delivery := each  project(...)        # one calculation run per hit
 
 `fold` is the most important pushed-down form: "sum of all Enemy HP" is O(N) if scanned in calculation every frame, but `fold sum` turns it into per-write delta maintenance.
 
+**Current limitations of `batch` / `fold`.**
+
+- **batch**: delivery is unordered (D3). The runtime aggregates one batch per `(calculation, subscriber)` per frame and delivers it once. The `Canonical` tier (C4) sorts by `(writer type, id, generation, field)`. `batch` cannot currently be used with conjunction `&` (Section 3.2).
+- **fold**: operators are the typed monoid set `{sum, count, min, max}`. Custom monoids are not exposed yet (open question three in Section 8). `min` and `max` are not invertible, so they are maintained with a multiset at `O(log n)` per write. `count` counts distinct contributing cells; `sum` ignores non-numeric writes. Member death, which has no write, is revoked out of band by the runtime and re-delivered as a shrunk aggregate in the next frame (Section 6.3). `fold` also cannot currently be used with conjunction `&`.
+
 ### 3.5 Admission Rule for Predicate Vocabulary
 
 A primitive may enter the predicate layer if and only if there is an index structure that can be built at registration time and keep its amortized check inside the Section 4 cost budget. The vocabulary is generated by the cost model, not by enumerating use cases. Expression power that cannot bind to an index must either be materialized as an entity or stay inside calculation.
+
+**Admission classes.** By the registration-time index they can bind to, predicate primitives fall into three outcomes:
+
+- **indexed**: the primitive binds to a registration-time index and stays amortized `O(1)` or `O(log s)`, so it is a first-class fast path. Examples: hash subscription chains for `own` / `inst`; value buckets for type scope + equality (`= constant`, `became`, `in {...}`, and `new.path = self` ref point lookups); shared sorted threshold tables / interval queries for type scope + constant thresholds or `crossed`.
+- **guard**: the primitive can only guard a positive trigger source and cannot trigger on its own. Negation (`and not`) is in this class. "No write happened" is not an event, so independent NOT would drag the system back to per-frame polling. The left conjunction branch must still be a positive trigger, whether indexed or scan-degenerate.
+- **scan-degenerate**: the primitive is admitted but degenerates into scanning the subscribers of that cell, `O(subscribers on that cell)`. Live thresholds, whose conditions reference subscriber own fields or `self`, and compound conditions that cannot bind to an index are in this class. The cost still does not depend on global scale, which is the honest degradation clause in Section 4.
 
 ---
 
@@ -145,19 +174,20 @@ Every write must be seen at least once by routing, and every true trigger must b
 
 **Cost invariant**: total frame scheduling cost is `O(|W|*log + |F|)`, independent of total predicate count, instance count, and data size.
 
-| Primitive | Runtime structure | Amortized cost per write |
-|---|---|---|
-| own / inst scope | `(type, id, field) -> subscription-chain hash` | `O(1) + triggers` |
-| type scope + constant threshold | shared sorted threshold table / interval tree for the cell | `O(log s + k)` |
-| type scope + equality | value -> bucket | `O(1) + k` |
-| condition with own fields (live threshold) | point lookup per subscriber | `O(subscribers on that cell)` |
-| changed / became / crossed | double-buffered old value | `O(1)` |
-| `&` conjunction | per-predicate frame bitset / count latch | `O(1)` per clause |
-| batch | predicate-private frame buffer append | `O(1)` |
-| fold sum / count | delta maintenance | `O(1)` |
-| fold min / max | heap or lazy recomputation | `O(log n)` |
+| Primitive | Runtime structure | Amortized cost per write | Class (Section 3.5) |
+|---|---|---|---|
+| own / inst scope | `(type, id, field) -> subscription-chain hash` | `O(1) + triggers` | indexed |
+| type scope + constant threshold | shared sorted threshold table / interval tree for the cell | `O(log s + k)` | indexed |
+| type scope + equality | value -> bucket | `O(1) + k` | indexed |
+| condition with own fields (live threshold) | point lookup per subscriber | `O(subscribers on that cell)` | scan-degenerate |
+| changed / became / crossed | double-buffered old value | `O(1)` | indexed(1) |
+| `&` conjunction (only `each`; gate, not join; <=31 branches; Section 3.2) | per-predicate frame bitset / count latch | `O(1)` per clause | indexed |
+| `and not` guard | reuses the positive trigger check on the left branch | `O(1)` | guard |
+| batch | predicate-private frame buffer append; unordered by D3 | `O(1)` | indexed |
+| fold sum / count | delta maintenance | `O(1)` | indexed |
+| fold min / max | heap or lazy recomputation | `O(log n)` | indexed |
 
-`s` is the number of constant-condition subscribers on that cell; `k` is the number of actual hits.
+`s` is the number of constant-condition subscribers on that cell; `k` is the number of actual hits. (1) `became` maps to value buckets and `crossed` maps to threshold tables, so both are indexed. Bare `changed` with a pure type scope has no constant to bucket by and falls back to scan-degenerate; under `own` / `inst` scope, the subscriber is the writer, so it remains indexed.
 
 **Honest degradation clause**: when a condition parameter references fields on the subscriber itself, the threshold is live and cannot be merged into a shared index. The cost degrades to the number of subscribers on that cell, still independent of global scale. If one cell is subscribed to by massive personalized conditions, flip the design and materialize the intermediate value as an entity.
 
@@ -180,6 +210,8 @@ Because predicates are data, all of this is done once at registration time. Runt
 These do not enter the predicate layer. The standard pattern is to build a singleton **index entity**, batch-subscribe to raw writes, maintain the index incrementally in its calculation, and write query results or index slices into its own fields. Downstream users subscribe to those ordinary fields.
 
 **Index as entity, view as data.** This keeps the predicate vocabulary closed while still making the optimal incremental-maintenance path available to user code.
+
+**Helper: `spatial`.** This repository provides `SpatialGrid` in `src/spatial.rs`, a uniform-grid helper for broad phase, area-of-interest, and range queries, as an implementation of the materialized-index pattern above. It is calculation-private incremental state held by an index entity's calculation closure: an implementation detail of Turing-complete code, not a core layer, not a predicate primitive, and not a fifth concept. It embodies the principle that costly optimizations expose interfaces but do not decide policy for the developer. A uniform grid is only a common sweet spot for moving objects and local-neighbor interaction; if a use case needs a hierarchical grid, BVH, or sweep-and-prune, it can swap the implementation behind the same query interface.
 
 ### 6.2 Clock and Per-Frame Logic -> runtime as Writer
 
@@ -237,6 +269,29 @@ each
 
 ## 8. Invariants and Open Questions
 
-**Invariants**: the four layers are closed; the only trigger source is previous-frame writes; write locality plus single writer (D1); writes are events (D2); snapshot reads; predicates are data fixed at registration time and compilable; the cost invariant is `O(|W|*log + |F|)` independent of predicate and instance counts; delivery is unordered (D3), so consumers must be order-independent.
+**Invariants**: the four layers are closed for business mechanisms. Derived consumer runtimes and materialized-index helpers reuse the four layers and are not fifth concepts (Sections 0 and 9). The only trigger source is previous-frame writes. Write locality plus single writer (D1). Writes are events (D2). Delivery is unordered (D3), so consumers must be order-independent. Effect confinement (D4): calculations have no side effects outside `ctx`, which is a precondition for reordering and parallel execution. Snapshot reads: current-frame writes are invisible to the current frame. Predicates are data fixed at registration time and compilable. The cost invariant is `O(|W|*log + |F|)`, independent of predicate and instance counts.
 
-**Open questions**: the shape of the `Clock` alarm interface and timer-wheel integration; whether `project` may perform projection-side arithmetic; whether `fold` exposes custom monoids and what reversibility or recomputation strategy would be required; and how expensive detection of "one calculation writes different values to the same field through multiple runs in one frame" should be, plus whether it is silent folding, warning, or error.
+**Open questions**: first, the shape of the `Clock` alarm interface and timer-wheel integration. Second, whether `project` may perform projection-side arithmetic; condition-side scalar arithmetic is already allowed (Section 3.3). Third, whether `fold` exposes custom monoids; if it does, reversibility or recomputation strategy must be specified, with `min` / `max` already serving as non-invertible precedents. Fourth, the detection cost and severity for "one calculation writes different values to the same field through multiple runs in one frame" (Section 2): silent folding, warning, or error. Fifth, the semantics of using conjunction `&` with `batch` / `fold`: under same-frame gating, what is aggregated and how many times? The current implementation rejects this at registration time (Section 3.2).
+
+---
+
+## 9. Derived Consumer Runtime (render)
+
+The four layers are the simulation core. **`render` is a second runtime built above it: a derived consumer runtime with a dynamic frame rate.** It is not part of the core, but it reuses the same four-layer closure and is not a fifth concept.
+
+**Design theorem.** `render = simulation - lifecycle + dynamic clock + sim write-log ingestion + interpolation primitives`. Render logic is also built from predicate + calculation. The differences are trigger sources, lifecycle ownership, and dependency direction.
+
+**Two trigger sources, dual to sim's "only trigger source."**
+
+- render clock tick -> **continuous update**: on every render frame, run over each present instance for camera damping, derived transforms, interpolation, and similar work. This is a dense ECS scan and the main hot path of render, because interpolation is inherently per-frame.
+- ingested sim write log -> **event reaction**: reuse the predicate algebra, including the same precompiled condition evaluator, while subscribing to the sim write stream.
+
+After sim enables ingestion with `Runtime::enable_render_feed()`, each frame retains the routed write set: the same write stream that Section 0 calls the only trigger source, including birth writes from external spawn. Render consumes it through `Runtime::committed_writes()`.
+
+**One-way dependency rule.** Render writes only render namespace fields (`RFieldId`) and reads sim fields through tracked mirrors. **Sim never reads render.** This structurally enforces concurrency decoupling and is an expression of field-level D1: render extension writers exclusively claim render fields through `claim_writes` (Section 0.1).
+
+**Shared lifecycle is owned by sim.** Render has no entry point for spawning or destroying shared entities; its sidecar rows passively follow sim birth and death deltas. If death fade-out is configured, render only delays reclaiming its own sidecar row by advancing a fade weight from 1 to 0 using real `dt`; it does not change the sim fact of life or death.
+
+**Interpolation is the render dual of fold.** `track(sim_field, Interp)` is maintained automatically by the render runtime each frame as `(prev, cur)` and evaluated by alpha. Like `fold`, it is declarative pushdown, not hand-written calculation logic.
+
+**Culling / LOD.** Render maintains its own `SpatialGrid`, fed by tracked position deltas ingested from sim, and performs render-rate camera queries to produce a visible set. Continuous update and submission are narrowed to the viewport. This is the render dual of Section 6.1's "materialize as index entity" pattern: it remains a composition of the registered pieces above, not a fourth registration concept. When disabled, behavior is byte-for-byte equivalent to no culling.

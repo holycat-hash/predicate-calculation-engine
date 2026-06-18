@@ -213,13 +213,12 @@ impl RenderStore {
     }
 
     pub(crate) fn write_render(&mut self, inst: InstanceId, f: RFieldId, v: Value) {
-        if let Some(id) = self.row_of(inst) {
-            if let Some(col) = self.types[inst.ty.0 as usize]
+        if let Some(id) = self.row_of(inst)
+            && let Some(col) = self.types[inst.ty.0 as usize]
                 .render_cols
                 .get_mut(f.0 as usize)
-            {
-                col.set(id, v);
-            }
+        {
+            col.set(id, v);
         }
     }
 

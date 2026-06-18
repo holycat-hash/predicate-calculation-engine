@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use pce::predicate::{lit, new_path, own, type_scope};
 use pce::{
     CmpOp, Cond, Delivery, EntityTypeId, Expr, FieldDef, FieldId, Input, InstanceId, Predicate,
-    Proj, Runtime, Scope, Value, ValRef,
+    Proj, Runtime, Scope, ValRef, Value,
 };
 
 const PRICE: i64 = 3;
@@ -136,7 +136,10 @@ fn setup() -> (Runtime, W) {
                 _ => 2,
             };
             ops.sort_by_key(|v| {
-                (rank(v), format!("{}{}", as_str(&path(v, "req")), as_str(&path(v, "salt"))))
+                (
+                    rank(v),
+                    format!("{}{}", as_str(&path(v, "req")), as_str(&path(v, "salt"))),
+                )
             });
             let mut balance = as_i64(&ctx.read_own(balance_f));
             let mut escrow = map_of(&ctx.read_own(escrow_f));
@@ -285,7 +288,10 @@ fn setup() -> (Runtime, W) {
 
 /// 守恒式：balance + Σescrow + price×items 在 saga 的每一帧边界都不变。
 fn conserved(rt: &Runtime, player: InstanceId, w: W) -> i64 {
-    let escrow: i64 = map_of(&rt.read(player, w.p_escrow)).values().map(as_i64).sum();
+    let escrow: i64 = map_of(&rt.read(player, w.p_escrow))
+        .values()
+        .map(as_i64)
+        .sum();
     as_i64(&rt.read(player, w.p_balance)) + escrow + PRICE * as_i64(&rt.read(player, w.p_items))
 }
 

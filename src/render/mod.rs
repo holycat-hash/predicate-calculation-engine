@@ -2,7 +2,7 @@
 //!
 //! 设计定理（见会话分析）：**render runtime = simulation runtime − 生命周期
 //! + 动态时钟 + sim 写日志摄入口 + 插值原语**。四层封闭不破——render 逻辑同样由
-//! predicate + calculation 构建，只是：
+//!   predicate + calculation 构建，只是：
 //!
 //! 1. **触发源有两条**（与 sim 的「唯一触发源」对偶）：
 //!    - render clock tick → 连续更新（[`RenderRuntime::continuous`]），ECS 稠密扫，
@@ -39,19 +39,23 @@ pub mod clock;
 pub mod ctx;
 pub mod handoff;
 pub mod interp;
+mod local;
 mod store;
 pub mod submission;
 pub mod visible;
 
 pub use clock::RenderClock;
-pub use ctx::{ContinuousFn, ReactionFn, RenderCtx, RenderInput};
+pub use ctx::{
+    ContinuousFn, LocalContinuousFn, ReactionFn, RenderCtx, RenderInput, RenderLocalCtx,
+};
 pub use handoff::{Publisher, SimFrame, TrackedDelta};
 pub use interp::{Interp, Track};
+pub use local::{RenderLocalFieldDef, RenderLocalId, RenderLocalTypeId};
 pub use store::RFieldId;
 pub use submission::{
-    RenderBinding, RenderPacket, SubmissionInstanceKey, SubmissionInstanceLayout,
-    SubmissionInstanceRow, SubmissionInstanceSlot, SubmissionInstanceSpan, SubmissionInstanceStream,
-    SubmissionView,
+    LocalSubmissionView, RenderBinding, RenderLocalPacket, RenderPacket, SubmissionInstanceKey,
+    SubmissionInstanceLayout, SubmissionInstanceRow, SubmissionInstanceSlot,
+    SubmissionInstanceSpan, SubmissionInstanceStream, SubmissionView,
 };
 pub use visible::{Axes, CullShape, lod_band};
 
@@ -59,11 +63,19 @@ use std::collections::{HashMap, HashSet};
 
 use crate::entity::{EntityTypeId, FieldId, InstanceId};
 use crate::predicate::{Cond, Expr, Proj, ValRef};
-use crate::runtime::{CompiledCond, Detect, Runtime, project_ro};
+use crate::runtime::{CompiledCond, CompiledProj, Detect, Runtime, project_ro};
 use crate::spatial::SpatialGrid;
 use crate::value::Value;
 
+use local::{LocalStore, RenderLocalCommand};
 use store::RenderStore;
+
+type RenderWrites = Vec<(RFieldId, Value)>;
+type LocalCommands = Vec<RenderLocalCommand>;
+type SharedContinuousResult = (InstanceId, RenderWrites, LocalCommands);
+type StagedSharedContinuous = (usize, InstanceId, RenderWrites, LocalCommands);
+type LocalContinuousResult = (RenderLocalId, RenderWrites, LocalCommands);
+type StagedLocalContinuous = (usize, RenderLocalId, RenderWrites, LocalCommands);
 
 struct Reaction {
     /// D1 / C5 检测消息里用作 owner 名。
@@ -73,7 +85,8 @@ struct Reaction {
     sim_field: FieldId,
     /// 预编译条件：复用 sim 的 [`CompiledCond`]（同一份扁平后缀求值器，走 `eval_ro`）。
     compiled: CompiledCond,
-    projs: Vec<Proj>,
+    /// 预编译投影：复用 sim 的 [`CompiledProj`]（含 OQ2 算术投影；只读子集无 own/self）。
+    proj_compiled: Vec<CompiledProj>,
     batched: bool,
     writes: HashSet<RFieldId>,
     f: ReactionFn,
@@ -85,6 +98,14 @@ struct Continuous {
     ty: EntityTypeId,
     writes: HashSet<RFieldId>,
     f: ContinuousFn,
+}
+
+struct LocalContinuous {
+    /// D1 / C5 检测消息里用作 owner 名。
+    name: String,
+    ty: RenderLocalTypeId,
+    writes: HashSet<RFieldId>,
+    f: LocalContinuousFn,
 }
 
 /// 一个被 `cull_type` opt-in 的剔除类型的登记。
@@ -120,6 +141,7 @@ struct Spatial {
 /// 第二个 runtime 实例：动态帧率的 render 侧。
 pub struct RenderRuntime {
     store: RenderStore,
+    local_store: LocalStore,
     tracks: Vec<Track>,
     /// (类型, sim 字段) → tracks 下标（可多个：同一 sim 字段可被多个 track 以不同
     /// 插值种类镜像；摄入增量时逐个喂，否则除最后注册者外全部停在默认值）。
@@ -128,8 +150,11 @@ pub struct RenderRuntime {
     sim_defaults: HashMap<(EntityTypeId, FieldId), Value>,
     reactions: Vec<Reaction>,
     continuous: Vec<Continuous>,
+    local_continuous: Vec<LocalContinuous>,
     /// render 侧 D1：(类型, render 字段) → 归属者描述（注册期冲突即错）。
     field_owner: HashMap<(EntityTypeId, RFieldId), String>,
+    /// render-local D1：(本地类型, render 字段) → 归属者描述。
+    local_field_owner: HashMap<(RenderLocalTypeId, RFieldId), String>,
     /// C5 检测档位（与 sim 同一 [`Detect`]）：管「同 calc 多次运行对同 render 字段写
     /// 不同值」的折叠序未定义告警。默认跟随构建档（debug→Warn / release→Silent）。
     detect: Detect,
@@ -140,6 +165,8 @@ pub struct RenderRuntime {
     active: Vec<(InstanceId, usize)>,
     /// 可渲染类型的提交绑定（注册序）：[`submission::assemble`] 据此装配提交视图。
     renderables: Vec<(EntityTypeId, RenderBinding)>,
+    /// render-local 可渲染类型绑定（注册序）：[`submission::assemble_local`] 装配。
+    local_renderables: Vec<(RenderLocalTypeId, RenderBinding)>,
     /// render 自管寿命（死亡淡出）：类型 → (淡出权重字段, 淡出时长秒)。sim 写死后，
     /// 该类型实体不即时回收 render 行，而是按真实 dt 把权重 1→0 推过去，到 0 才回收。
     death_fade: HashMap<EntityTypeId, (RFieldId, f64)>,
@@ -164,17 +191,21 @@ impl RenderRuntime {
         }
         RenderRuntime {
             store: RenderStore::new(sim.type_count()),
+            local_store: LocalStore::new(),
             tracks: vec![],
             track_of: HashMap::new(),
             sim_defaults,
             reactions: vec![],
             continuous: vec![],
+            local_continuous: vec![],
             field_owner: HashMap::new(),
+            local_field_owner: HashMap::new(),
             detect: Detect::default(),
             clock: RenderClock::new(),
             last_ingested: 0,
             active: vec![],
             renderables: vec![],
+            local_renderables: vec![],
             death_fade: HashMap::new(),
             dying: vec![],
             spatial: None,
@@ -192,6 +223,37 @@ impl RenderRuntime {
     /// 在某类型注册一个纯 render 字段（render 独占写，D1 render 侧）。
     pub fn add_render_field(&mut self, ty: EntityTypeId, default: Value) -> RFieldId {
         self.store.add_render_field(ty, default)
+    }
+
+    /// 注册一个 render-local 类型（粒子 / 飘字等）。本地类型完全由 render runtime
+    /// 管理：字段在 render 命名空间，实例走本地池化 id，生命周期不回写 sim。
+    pub fn register_local_type(
+        &mut self,
+        name: &str,
+        fields: Vec<RenderLocalFieldDef>,
+    ) -> RenderLocalTypeId {
+        self.local_store.add_type(name, fields)
+    }
+
+    /// 查询 render-local 类型的字段 id。
+    pub fn local_field(&self, ty: RenderLocalTypeId, name: &str) -> Result<RFieldId, String> {
+        self.local_store.field(ty, name)
+    }
+
+    /// 外部宿主直接创建一个 render-local 实体。高频特效更常见的路径是
+    /// [`RenderCtx::spawn_local`]：在 render reaction / continuous 中排队创建。
+    pub fn spawn_local(
+        &mut self,
+        ty: RenderLocalTypeId,
+        init: Vec<(RFieldId, Value)>,
+    ) -> Result<RenderLocalId, String> {
+        self.local_store.spawn(ty, init)
+    }
+
+    /// 外部宿主销毁一个 render-local 实体。过期粒子通常在 [`RenderLocalCtx::destroy_self`]
+    /// 中自毁。
+    pub fn destroy_local(&mut self, id: RenderLocalId) -> bool {
+        self.local_store.destroy(id)
     }
 
     /// 声明镜像某 sim 字段并按 `kind` 维护插值输出，返回插值结果所在的 render 字段。
@@ -248,12 +310,13 @@ impl RenderRuntime {
         // 复用 sim 的预编译条件：render 反应条件是 `Cond` 的只读子集（无 own/self），
         // 编成同一份扁平后缀程序，运行期走 `eval_ro`——render 不再 fork 求值器。
         let compiled = CompiledCond::compile(&cond);
+        let proj_compiled = projs.iter().map(CompiledProj::compile).collect();
         self.reactions.push(Reaction {
             name: name.to_string(),
             ty,
             sim_field,
             compiled,
-            projs,
+            proj_compiled,
             batched,
             writes: writes.iter().copied().collect(),
             f,
@@ -279,6 +342,25 @@ impl RenderRuntime {
         Ok(())
     }
 
+    /// 注册 render-local 连续更新：render clock 每帧对该本地类型每个存活实例运行一次。
+    /// local calc 可写自己的 local 字段，可 `destroy_self()`，也可继续 `spawn_local()`。
+    pub fn local_continuous(
+        &mut self,
+        name: &str,
+        ty: RenderLocalTypeId,
+        writes: &[RFieldId],
+        f: LocalContinuousFn,
+    ) -> Result<(), String> {
+        self.claim_local_writes(ty, writes, name)?;
+        self.local_continuous.push(LocalContinuous {
+            name: name.to_string(),
+            ty,
+            writes: writes.iter().copied().collect(),
+            f,
+        });
+        Ok(())
+    }
+
     /// 声明某类型可渲染并绑定其提交字段（哪些 render 字段是 transform / handle /
     /// 可见性 / 动画态 / 淡出）。[`RenderRuntime::submit`] 据此装配提交视图。每类型
     /// 一份绑定，重复注册即错。绑定只引用已存在的 render 字段（track 输出 / 纯 render
@@ -289,6 +371,21 @@ impl RenderRuntime {
         }
         self.validate_render_binding(ty, &binding)?;
         self.renderables.push((ty, binding));
+        Ok(())
+    }
+
+    /// 声明某 render-local 类型可提交。字段含义与 [`RenderRuntime::renderable`] 相同，
+    /// 但扫描源是 render 本地池而不是 sim sidecar。
+    pub fn local_renderable(
+        &mut self,
+        ty: RenderLocalTypeId,
+        binding: RenderBinding,
+    ) -> Result<(), String> {
+        if self.local_renderables.iter().any(|(t, _)| *t == ty) {
+            return Err(format!("render-local 类型 {} 已注册 renderable 绑定", ty.0));
+        }
+        self.validate_local_render_binding(ty, &binding)?;
+        self.local_renderables.push((ty, binding));
         Ok(())
     }
 
@@ -304,6 +401,15 @@ impl RenderRuntime {
             .filter(|sp| sp.active)
             .map(|sp| &sp.visible);
         submission::assemble(&self.store, &self.renderables, visible)
+    }
+
+    /// 装配本 render 帧的 render-local 临时实体提交视图。它与 shared [`submit`] 分开，
+    /// 让后端可以把粒子 / 飘字走独立 pass，而不需要伪造 sim [`InstanceId`]。
+    ///
+    /// [`submit`]: RenderRuntime::submit
+    /// [`InstanceId`]: crate::entity::InstanceId
+    pub fn submit_local(&self) -> LocalSubmissionView {
+        submission::assemble_local(&self.local_store, &self.local_renderables)
     }
 
     /// 开启某类型的 render 自管死亡淡出：sim 写死后，render 不即时回收行，而是在
@@ -404,12 +510,10 @@ impl RenderRuntime {
         if let Some(df) = dist_field {
             self.claim_writes(ty, &[df], &format!("visible_set_dist({})", ty.0))?;
         }
-        let track_slot = self
-            .track_of
-            .get(&(ty, translation_sim_field))
-            .and_then(|tis| tis.first())
-            .map(|&ti| self.tracks[ti].slot)
+        let track_idx = self
+            .cull_track_index(ty, translation_sim_field)
             .expect("cull_type 已验证 translation_sim_field 被 track");
+        let track_slot = self.tracks[track_idx].slot;
         let axes = self.spatial.as_ref().unwrap().axes;
         let mut live = vec![];
         self.store.for_each_live(ty, |inst| live.push(inst));
@@ -437,6 +541,19 @@ impl RenderRuntime {
         Ok(())
     }
 
+    fn cull_track_index(&self, ty: EntityTypeId, sim_field: FieldId) -> Option<usize> {
+        let tracks = self.track_of.get(&(ty, sim_field))?;
+        if let Some((_, binding)) = self.renderables.iter().find(|(t, _)| *t == ty)
+            && let Some(translation) = binding.translation
+            && let Some(&ti) = tracks
+                .iter()
+                .find(|&&ti| self.tracks[ti].out == translation)
+        {
+            return Some(ti);
+        }
+        tracks.first().copied()
+    }
+
     fn validate_render_binding(
         &self,
         ty: EntityTypeId,
@@ -456,6 +573,33 @@ impl RenderRuntime {
             }
             if !seen.insert(f) {
                 return Err(format!("renderable 重复绑定 render 字段 {}.{}", ty.0, f.0));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_local_render_binding(
+        &self,
+        ty: RenderLocalTypeId,
+        binding: &RenderBinding,
+    ) -> Result<(), String> {
+        if !self.local_store.has_type(ty) {
+            return Err(format!("无 render-local 类型 id {}", ty.0));
+        }
+        let mut seen = HashSet::new();
+        for (slot, field) in render_binding_fields(binding) {
+            let Some(f) = field else { continue };
+            if !self.local_store.has_field(ty, f) {
+                return Err(format!(
+                    "local_renderable 绑定 {slot} 引用不存在字段 {}.{}",
+                    ty.0, f.0
+                ));
+            }
+            if !seen.insert(f) {
+                return Err(format!(
+                    "local_renderable 重复绑定 render 字段 {}.{}",
+                    ty.0, f.0
+                ));
             }
         }
         Ok(())
@@ -485,6 +629,39 @@ impl RenderRuntime {
         }
         for &w in writes {
             self.field_owner.insert((ty, w), owner.to_string());
+        }
+        Ok(())
+    }
+
+    /// D1 render-local 侧：本地字段静态归属唯一写者，注册期冲突即错。
+    fn claim_local_writes(
+        &mut self,
+        ty: RenderLocalTypeId,
+        writes: &[RFieldId],
+        owner: &str,
+    ) -> Result<(), String> {
+        for (i, &w) in writes.iter().enumerate() {
+            if !self.local_store.has_field(ty, w) {
+                return Err(format!(
+                    "{owner} 声明不存在 render-local 字段 {}.{}",
+                    ty.0, w.0
+                ));
+            }
+            if let Some(prev) = self.local_field_owner.get(&(ty, w)) {
+                return Err(format!(
+                    "D1（render-local 侧）冲突：字段 {}.{} 已归属 {prev}",
+                    ty.0, w.0
+                ));
+            }
+            if writes[..i].contains(&w) {
+                return Err(format!(
+                    "{owner} 重复声明 render-local 字段 {}.{}",
+                    ty.0, w.0
+                ));
+            }
+        }
+        for &w in writes {
+            self.local_field_owner.insert((ty, w), owner.to_string());
         }
         Ok(())
     }
@@ -684,6 +861,7 @@ impl RenderRuntime {
         // continuous 驱动则用上一帧相机位（1 帧延迟，cull 余量吸收）。未启用剔除时空操作。
         self.compute_visible();
         self.run_continuous();
+        self.run_local_continuous();
     }
 
     fn push_dying(&mut self, inst: InstanceId, duration: f64) -> bool {
@@ -819,11 +997,20 @@ impl RenderRuntime {
     }
 
     fn run_continuous(&mut self) {
+        if self.continuous.is_empty() {
+            return;
+        }
         let detect = self.detect;
+        let clock = self.clock;
+        // 阶段一：执行——所有 continuous 读 run_continuous 起点的**冻结** store，产出本地写
+        // 缓冲（B3 快照读，与 sim 对齐）。本帧连续写在帧末统一提交、扫描期互不可见：故跨
+        // 实例 / 跨 continuous 的 `read_of` 看到上一帧的连续输出（确定、与扫描序无关）。
+        // 每 (calc, 实例) 每帧只跑一次 ⇒ 读**自身**字段与「即时提交」逐字等价，仅改「读他人
+        // 本帧连续输出」的可见性。只读 `&store` ⇒ parallel feature 下按实例并行（render 字段
+        // 单写者、写本地缓冲，无竞争、无伪共享）。
+        let mut staged: Vec<StagedSharedContinuous> = vec![];
         for ci in 0..self.continuous.len() {
             let ty = self.continuous[ci].ty;
-            let name = self.continuous[ci].name.clone();
-            let declared = self.continuous[ci].writes.clone();
             // 剔除类型且本帧剔除生效 → 只扫可见集（离屏实体派生 render 态冻结，回屏即续，
             // 正是剔除本意）；否则（未剔除 / 相机缺席兜底）稠密扫存活。
             let mut insts = vec![];
@@ -839,25 +1026,168 @@ impl RenderRuntime {
             } else {
                 self.store.for_each_live(ty, |i| insts.push(i));
             }
-            for inst in insts {
-                let writes = {
+            let store = &self.store;
+            let f = &self.continuous[ci].f;
+            #[cfg(feature = "parallel")]
+            let calc_writes: Vec<SharedContinuousResult> = {
+                use rayon::prelude::*;
+                insts
+                    .par_iter()
+                    .map(|&inst| {
+                        let mut ctx = RenderCtx {
+                            store,
+                            self_id: inst,
+                            clock,
+                            writes: vec![],
+                            local_commands: vec![],
+                        };
+                        f(&mut ctx);
+                        (inst, ctx.writes, ctx.local_commands)
+                    })
+                    .collect()
+            };
+            #[cfg(not(feature = "parallel"))]
+            let calc_writes: Vec<SharedContinuousResult> = insts
+                .iter()
+                .map(|&inst| {
                     let mut ctx = RenderCtx {
-                        store: &self.store,
+                        store,
                         self_id: inst,
-                        clock: self.clock,
+                        clock,
                         writes: vec![],
+                        local_commands: vec![],
                     };
-                    (self.continuous[ci].f)(&mut ctx);
-                    ctx.writes
-                };
-                commit_writes(&mut self.store, inst, &declared, &name, detect, writes);
+                    f(&mut ctx);
+                    (inst, ctx.writes, ctx.local_commands)
+                })
+                .collect();
+            for (inst, writes, local_commands) in calc_writes {
+                staged.push((ci, inst, writes, local_commands));
+            }
+        }
+        // 阶段二：提交——帧末一次性写回（各实例写自己行，D1 ⇒ 提交序不影响结果）。
+        let mut pending_local = vec![];
+        for (ci, inst, writes, local_commands) in staged {
+            commit_writes(
+                &mut self.store,
+                inst,
+                &self.continuous[ci].writes,
+                &self.continuous[ci].name,
+                detect,
+                writes,
+            );
+            pending_local.extend(local_commands);
+        }
+        self.apply_local_commands(pending_local);
+    }
+
+    fn run_local_continuous(&mut self) {
+        if self.local_continuous.is_empty() {
+            return;
+        }
+        let detect = self.detect;
+        let clock = self.clock;
+        let mut staged: Vec<StagedLocalContinuous> = vec![];
+        for ci in 0..self.local_continuous.len() {
+            let ty = self.local_continuous[ci].ty;
+            let mut locals = vec![];
+            self.local_store.for_each_live(ty, |id| locals.push(id));
+            let store = &self.local_store;
+            let f = &self.local_continuous[ci].f;
+            #[cfg(feature = "parallel")]
+            let calc_writes: Vec<LocalContinuousResult> = {
+                use rayon::prelude::*;
+                locals
+                    .par_iter()
+                    .map(|&id| {
+                        let mut ctx = RenderLocalCtx {
+                            store,
+                            self_id: id,
+                            clock,
+                            writes: vec![],
+                            local_commands: vec![],
+                        };
+                        f(&mut ctx);
+                        (id, ctx.writes, ctx.local_commands)
+                    })
+                    .collect()
+            };
+            #[cfg(not(feature = "parallel"))]
+            let calc_writes: Vec<LocalContinuousResult> = locals
+                .iter()
+                .map(|&id| {
+                    let mut ctx = RenderLocalCtx {
+                        store,
+                        self_id: id,
+                        clock,
+                        writes: vec![],
+                        local_commands: vec![],
+                    };
+                    f(&mut ctx);
+                    (id, ctx.writes, ctx.local_commands)
+                })
+                .collect();
+            for (id, writes, local_commands) in calc_writes {
+                staged.push((ci, id, writes, local_commands));
+            }
+        }
+        let mut pending_local = vec![];
+        for (ci, id, writes, local_commands) in staged {
+            commit_local_writes(
+                &mut self.local_store,
+                id,
+                &self.local_continuous[ci].writes,
+                &self.local_continuous[ci].name,
+                detect,
+                writes,
+            );
+            pending_local.extend(local_commands);
+        }
+        self.apply_local_commands(pending_local);
+    }
+
+    fn apply_local_commands(&mut self, commands: Vec<RenderLocalCommand>) {
+        for cmd in commands {
+            match cmd {
+                RenderLocalCommand::Spawn { ty, init } => {
+                    if let Err(e) = self.local_store.spawn(ty, init) {
+                        let msg = format!("render-local spawn 命令非法：{e}");
+                        if self.detect == Detect::Strict {
+                            panic!("{msg}");
+                        }
+                        if self.detect == Detect::Warn {
+                            eprintln!("{msg}");
+                        }
+                    }
+                }
+                RenderLocalCommand::Destroy(id) => {
+                    self.local_store.destroy(id);
+                }
             }
         }
     }
 
     fn run_reactions(&mut self, sf: &SimFrame) {
+        if self.reactions.is_empty() {
+            return;
+        }
         let detect = self.detect;
         let deaths: HashSet<InstanceId> = sf.deaths.iter().copied().collect();
+        // 按 (类型, 字段) 给本帧事件分桶一次：反应匹配从 O(reactions×events) 降到
+        // O(events + Σ 各反应命中其 cell 的事件数)——sim 路由「索引查找」的 render 对偶。
+        // 只做 cell 级分桶、不复用 sim 的值桶/阈值表细分：render 反应订阅者恒为 writer
+        // 本身，与 TypeIndex 的「type scope 扇出到全类型实例」语义不同，整张不可直接复用。
+        // 桶内保 sf.events 原序 ⇒ 命中序与旧逐反应线性扫逐字相同（batch 分组序不变）。
+        // 死者事件预剔除（render 不对已死实体反应）。
+        let mut events_by_cell: HashMap<(EntityTypeId, FieldId), Vec<usize>> = HashMap::new();
+        for (i, rec) in sf.events.iter().enumerate() {
+            if !deaths.contains(&rec.inst) {
+                events_by_cell
+                    .entry((rec.inst.ty, rec.field))
+                    .or_default()
+                    .push(i);
+            }
+        }
         for ri in 0..self.reactions.len() {
             let ty = self.reactions[ri].ty;
             let sim_field = self.reactions[ri].sim_field;
@@ -868,17 +1198,15 @@ impl RenderRuntime {
             // （`eval_ro`），投影复用 `project_ro`——render 不再持有自己的副本。
             let mut eval_stack: Vec<Value> = vec![];
             let mut hits: Vec<(InstanceId, Vec<Value>)> = vec![];
-            for rec in &sf.events {
-                if deaths.contains(&rec.inst) {
-                    continue;
-                }
-                if rec.inst.ty == ty
-                    && rec.field == sim_field
-                    && self.reactions[ri]
+            if let Some(idxs) = events_by_cell.get(&(ty, sim_field)) {
+                for &i in idxs {
+                    let rec = &sf.events[i];
+                    if self.reactions[ri]
                         .compiled
                         .eval_ro(&rec.new, &rec.old, &mut eval_stack)
-                {
-                    hits.push((rec.inst, project_ro(&self.reactions[ri].projs, rec)));
+                    {
+                        hits.push((rec.inst, project_ro(&self.reactions[ri].proj_compiled, rec)));
+                    }
                 }
             }
             if batched {
@@ -896,34 +1224,38 @@ impl RenderRuntime {
                         continue;
                     }
                     let rows = groups.remove(&inst).unwrap();
-                    let writes = {
+                    let (writes, local_commands) = {
                         let mut ctx = RenderCtx {
                             store: &self.store,
                             self_id: inst,
                             clock: self.clock,
                             writes: vec![],
+                            local_commands: vec![],
                         };
                         (self.reactions[ri].f)(&mut ctx, &RenderInput::Batch(rows));
-                        ctx.writes
+                        (ctx.writes, ctx.local_commands)
                     };
                     commit_writes(&mut self.store, inst, &declared, &name, detect, writes);
+                    self.apply_local_commands(local_commands);
                 }
             } else {
                 for (inst, row) in hits {
                     if !self.store.is_present(inst) {
                         continue;
                     }
-                    let writes = {
+                    let (writes, local_commands) = {
                         let mut ctx = RenderCtx {
                             store: &self.store,
                             self_id: inst,
                             clock: self.clock,
                             writes: vec![],
+                            local_commands: vec![],
                         };
                         (self.reactions[ri].f)(&mut ctx, &RenderInput::Each(row));
-                        ctx.writes
+                        (ctx.writes, ctx.local_commands)
                     };
                     commit_writes(&mut self.store, inst, &declared, &name, detect, writes);
+                    self.apply_local_commands(local_commands);
                 }
             }
         }
@@ -940,6 +1272,16 @@ impl RenderRuntime {
     /// （render 自管寿命未回收），故 render「在场」= sim 存活 ⊔ 淡出尸体。
     pub fn is_present(&self, inst: InstanceId) -> bool {
         self.store.is_present(inst)
+    }
+
+    /// 读 render-local 实体字段。已销毁 / 旧 generation 句柄读到 `Null`。
+    pub fn read_local(&self, id: RenderLocalId, f: RFieldId) -> Value {
+        self.local_store.read(id, f)
+    }
+
+    /// render-local 实体是否仍在本地池中存活。
+    pub fn is_local_present(&self, id: RenderLocalId) -> bool {
+        self.local_store.is_present(id)
     }
 
     pub fn clock(&self) -> RenderClock {
@@ -959,6 +1301,11 @@ impl RenderRuntime {
     /// 当前正在死亡淡出（render 接管寿命、尚未回收）的尸体数。
     pub fn dying_count(&self) -> usize {
         self.dying.len()
+    }
+
+    /// 某 render-local 类型当前存活实例数（检视本地池 churn / 回收情况）。
+    pub fn local_count(&self, ty: RenderLocalTypeId) -> usize {
+        self.local_store.live_count(ty)
     }
 }
 
@@ -1018,21 +1365,60 @@ fn commit_writes(
     }
 }
 
-// ---- 反应条件 / 投影准入校验（v1 子集：new / old / 常量；求值复用 route 的预编译器）----
-
-fn validate_reaction_cond(c: &Cond) -> Result<(), String> {
-    fn expr_ok(e: &Expr) -> bool {
-        match e {
-            Expr::Val(v) => !matches!(v, ValRef::Own(_) | ValRef::SelfRef),
-            Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) => {
-                expr_ok(a) && expr_ok(b)
+fn commit_local_writes(
+    store: &mut LocalStore,
+    id: RenderLocalId,
+    declared: &HashSet<RFieldId>,
+    owner: &str,
+    detect: Detect,
+    writes: Vec<(RFieldId, Value)>,
+) {
+    let mut folded: Vec<(RFieldId, Value)> = vec![];
+    for (f, v) in writes {
+        assert!(
+            declared.contains(&f),
+            "render-local calc {owner} 写了未声明的字段 {}（D1 render-local 侧要求静态写集）",
+            f.0
+        );
+        if let Some(slot) = folded.iter_mut().find(|(ff, _)| *ff == f) {
+            if slot.1 != v && detect != Detect::Silent {
+                let msg = format!(
+                    "[PCE-render-local] {owner} 多次运行对同字段 {} 写入不同值，折叠序未定义",
+                    f.0
+                );
+                if detect == Detect::Strict {
+                    panic!("{msg}");
+                }
+                eprintln!("{msg}");
             }
+            slot.1 = v;
+        } else {
+            folded.push((f, v));
         }
     }
+    for (f, v) in folded {
+        store.write(id, f, v);
+    }
+}
+
+// ---- 反应条件 / 投影准入校验（v1 子集：new / old / 常量；求值复用 route 的预编译器）----
+
+/// render 只读 `Expr` 准入：只许 new/old/常量，不引用 own/self（订阅者行）。
+/// 条件侧与投影侧（OQ2 算术投影）共用此裁定 ⇒ render 求值器走 `None`-sub 路径不可达 own/self。
+fn render_expr_ro_ok(e: &Expr) -> bool {
+    match e {
+        Expr::Val(v) => !matches!(v, ValRef::Own(_) | ValRef::SelfRef),
+        Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) => {
+            render_expr_ro_ok(a) && render_expr_ro_ok(b)
+        }
+    }
+}
+
+fn validate_reaction_cond(c: &Cond) -> Result<(), String> {
     let ok = match c {
         Cond::True | Cond::InRange(..) | Cond::InSet(_) | Cond::Changed | Cond::Became(_) => true,
-        Cond::Cmp(a, _, b) => expr_ok(a) && expr_ok(b),
-        Cond::Crossed(t, _) => expr_ok(t),
+        Cond::Cmp(a, _, b) => render_expr_ro_ok(a) && render_expr_ro_ok(b),
+        Cond::Crossed(t, _) => render_expr_ro_ok(t),
         Cond::And(a, b) | Cond::Or(a, b) | Cond::AndNot(a, b) => {
             return validate_reaction_cond(a).and(validate_reaction_cond(b));
         }
@@ -1046,8 +1432,14 @@ fn validate_reaction_cond(c: &Cond) -> Result<(), String> {
 
 fn validate_reaction_projs(projs: &[Proj]) -> Result<(), String> {
     for p in projs {
-        if matches!(p, Proj::Own(_)) {
-            return Err("render 反应投影 v1 只许 new/old/writer（不投影 own）".into());
+        match p {
+            Proj::Own(_) => {
+                return Err("render 反应投影 v1 只许 new/old/writer（不投影 own）".into());
+            }
+            Proj::Expr(e) if !render_expr_ro_ok(e) => {
+                return Err("render 反应投影的算术只许 new/old/常量（不引用 own/self）".into());
+            }
+            _ => {}
         }
     }
     Ok(())

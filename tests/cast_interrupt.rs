@@ -152,16 +152,16 @@ fn setup() -> (Runtime, F) {
                 }
             }
 
-            if phase == "idle" {
-                if let Some(begin) = begins.iter().max_by_key(|v| as_i64(&path(v, "frame"))) {
-                    let frame = as_i64(&path(begin, "frame"));
-                    cost = as_i64(&path(begin, "cost"));
-                    mana -= cost;
-                    seq += 1;
-                    phase = "casting".to_string();
-                    due_at = frame + CAST_TIME;
-                    unint = due_at - UNINTAIL;
-                }
+            if phase == "idle"
+                && let Some(begin) = begins.iter().max_by_key(|v| as_i64(&path(v, "frame")))
+            {
+                let frame = as_i64(&path(begin, "frame"));
+                cost = as_i64(&path(begin, "cost"));
+                mana -= cost;
+                seq += 1;
+                phase = "casting".to_string();
+                due_at = frame + CAST_TIME;
+                unint = due_at - UNINTAIL;
             }
 
             if phase == "casting" {

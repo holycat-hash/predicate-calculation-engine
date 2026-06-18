@@ -4,7 +4,7 @@
 //! 代价存在，但显式、可见、自付。这是「每帧都要跑」逻辑的唯一合法出口。
 //!
 //! 定时语义经 alarm：到点 runtime 写 `Clock.alarm = payload`，订阅者 each 触发。
-//! 接口形态是开放问题（§8）；此处用按帧号桶的简化 timer wheel，O(1)/帧摊销。
+//! 接口：`set_alarm`（绝对帧）/ `set_alarm_in`（相对帧）；此处用按帧号桶的简化 timer wheel，O(1)/帧摊销。
 
 use std::collections::HashMap;
 

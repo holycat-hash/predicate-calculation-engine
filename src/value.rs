@@ -7,9 +7,10 @@ use std::collections::BTreeMap;
 
 use crate::entity::InstanceId;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum Value {
     /// ref 被结算清空、或字段尚未写入时的值；`became(null)` 用它收尸。
+    #[default]
     Null,
     Bool(bool),
     Int(i64),
@@ -110,12 +111,6 @@ impl Value {
             (Some(a), Some(b)) => a.partial_cmp(&b),
             _ => None,
         }
-    }
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Value::Null
     }
 }
 

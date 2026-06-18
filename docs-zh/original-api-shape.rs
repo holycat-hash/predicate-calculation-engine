@@ -587,7 +587,8 @@ fn resolve_cond(rt: &Runtime, ty: EntityTypeId, c: &Ci) -> Result<Cond, String> 
 }
 
 /// 投影解析（§3.4 可投影集：new/old 路径、writer id、own 字段）。
-/// 投影侧运算未开放（§8 开放问题二），常量/self/四则在此报错。
+/// 注：核心库已开放投影侧四则（OQ2，见 route.rs `CompiledProj::Expr`）；
+/// 此教学 shim 未跟进，仅解析 new/old/writer/own。
 fn resolve_projs(rt: &Runtime, ty: EntityTypeId, ps: &[E]) -> Result<Vec<Proj>, String> {
     ps.iter()
         .map(|e| {

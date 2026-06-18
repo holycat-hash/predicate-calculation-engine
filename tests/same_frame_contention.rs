@@ -32,8 +32,7 @@ fn setup() -> (Runtime, W) {
         ],
         false,
     );
-    let item_ty =
-        rt.register_entity_type("Item", vec![FieldDef::reference("owner")], false);
+    let item_ty = rt.register_entity_type("Item", vec![FieldDef::reference("owner")], false);
     let w = W {
         unit_ty,
         item_ty,
@@ -50,7 +49,11 @@ fn setup() -> (Runtime, W) {
         Predicate::new(
             type_scope(unit_ty, w.claim),
             Cond::And(
-                Box::new(Cond::Cmp(new_path(&["item"]), CmpOp::Eq, Expr::Val(ValRef::SelfRef))),
+                Box::new(Cond::Cmp(
+                    new_path(&["item"]),
+                    CmpOp::Eq,
+                    Expr::Val(ValRef::SelfRef),
+                )),
                 Box::new(Cond::Cmp(own_field(owner_f), CmpOp::Eq, lit(Value::Null))),
             ),
             Delivery::Batch(vec![
@@ -65,7 +68,7 @@ fn setup() -> (Runtime, W) {
             let mut best: Option<(i64, i64, Value)> = None;
             for row in rows {
                 let key = (as_i64(&row[1]), as_i64(&row[2]));
-                if best.as_ref().map_or(true, |(p, s, _)| key > (*p, *s)) {
+                if best.as_ref().is_none_or(|(p, s, _)| key > (*p, *s)) {
                     best = Some((key.0, key.1, row[0].clone()));
                 }
             }

@@ -68,3 +68,51 @@ fn same_frame_alarm_writes_keep_snapshot_old_value() {
     rt.step();
     assert_eq!(rt.read(w0, f_bad_old), Value::Int(0));
 }
+
+/// OQ1：`set_alarm_in` 相对排程——N 帧后写 `Clock.alarm`，订阅者到点触发一次（含 payload）。
+#[test]
+fn relative_alarm_fires_after_n_frames() {
+    let mut rt = Runtime::new();
+    let clock_ty = rt.clock().ty;
+    let clock_alarm = rt.clock().f_alarm;
+    let watch = rt.register_entity_type("Watch", vec![field("rang", 0)], true);
+    let f_rang = rt.field(watch, "rang");
+
+    rt.register_calculation(
+        "on_alarm",
+        watch,
+        Predicate::new(
+            type_scope(clock_ty, clock_alarm),
+            Cond::Became(Value::Int(7)), // 只在 payload=7 的 alarm 上触发（同时验证排程与载荷）
+            Delivery::Each(vec![]),
+        ),
+        &[f_rang],
+        Box::new(move |ctx, _| {
+            let n = ctx.read_own(f_rang).as_i64().unwrap_or(0);
+            ctx.write(f_rang, n + 1);
+        }),
+    )
+    .unwrap();
+
+    let w0 = rt.alive(watch)[0];
+    rt.set_alarm_in(2, Value::Int(7)); // frame()=0 → at_frame=2
+    rt.step(); // frame 1：未到点
+    assert_eq!(rt.read(w0, f_rang), Value::Int(0), "第 1 帧未到点");
+    rt.step(); // frame 2：alarm 写 7 → Became(7) 触发一次
+    assert_eq!(rt.read(w0, f_rang), Value::Int(1), "第 2 帧到点触发一次");
+    rt.step(); // frame 3：无 alarm 写 → 无触发（缺席不是事件）
+    assert_eq!(rt.read(w0, f_rang), Value::Int(1), "到点后不再触发");
+}
+
+#[test]
+fn relative_alarm_saturates_instead_of_overflowing() {
+    let mut rt = Runtime::new();
+    rt.step();
+    rt.set_alarm_in(u64::MAX, Value::Int(1));
+    rt.step();
+    assert_eq!(
+        rt.read(rt.clock().inst, rt.clock().f_alarm),
+        Value::Null,
+        "overflowing relative alarms must not wrap into an immediate/past frame"
+    );
+}

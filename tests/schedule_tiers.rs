@@ -3,7 +3,8 @@
 
 use pce::predicate::{own, type_scope};
 use pce::{
-    CalcOptions, Cond, Delivery, FieldDef, Predicate, Proj, Residency, Runtime, Tier, Value,
+    CalcOptions, Cond, Delivery, FieldDef, KernelIr, KernelOp, KernelWrite, Predicate, Proj,
+    Residency, Runtime, Tier, Value,
 };
 
 fn field(name: &str, default: impl Into<Value>) -> FieldDef {
@@ -96,9 +97,17 @@ fn schedule_resolves_residency_partition() {
             CalcOptions {
                 tier: Tier::Kernel,
                 residency: Residency::Gpu,
+                kernel_ir: Some(KernelIr::new(vec![KernelWrite::new(
+                    f_o2,
+                    vec![
+                        KernelOp::ReadOwn(f_o2),
+                        KernelOp::Const(Value::Int(1)),
+                        KernelOp::Add,
+                    ],
+                )])),
                 ..CalcOptions::default()
             },
-            Box::new(move |ctx, _| ctx.write(f_o2, ctx.read_own(f_o2).as_i64().unwrap() + 1)),
+            Box::new(move |_, _| panic!("kernel IR path must not call closure fallback")),
         )
         .unwrap();
 

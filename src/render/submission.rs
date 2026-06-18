@@ -23,6 +23,7 @@ use std::ops::Range;
 use crate::entity::{EntityTypeId, InstanceId};
 use crate::value::Value;
 
+use super::local::{LocalStore, RenderLocalId, RenderLocalTypeId};
 use super::store::{RFieldId, RenderStore};
 
 /// 某可渲染类型的字段绑定：声明哪些 render 字段填充提交包的各槽。未绑定的槽在包里
@@ -67,6 +68,21 @@ pub struct RenderPacket {
     pub anim_state: Value,
     pub anim_phase: f64,
     /// 淡出权重 `[0,1]`：1 实心、0 淡尽（淡尽者已被排除，故恒 `>0`）。
+    pub fade: f64,
+}
+
+/// 一个 render-local 临时实体的提交包。字段语义与 [`RenderPacket`] 相同，但 source id
+/// 是 render 本地池的 [`RenderLocalId`]，不会伪装成 sim [`InstanceId`]。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderLocalPacket {
+    pub local: RenderLocalId,
+    pub translation: Value,
+    pub rotation: Value,
+    pub scale: Value,
+    pub mesh: Value,
+    pub material: Value,
+    pub anim_state: Value,
+    pub anim_phase: f64,
     pub fade: f64,
 }
 
@@ -253,38 +269,33 @@ impl SubmissionInstanceRow {
 
     /// 从语义 packet 派生固定行。`packet_index` 是回查语义 packet / `InstanceId` 的唯一桥。
     pub fn from_packet(packet: &RenderPacket, packet_index: u32) -> Self {
-        let default = SubmissionInstanceRow::default();
-        let translation = vec3_f32(&packet.translation).unwrap_or([
-            default.translation_fade[0],
-            default.translation_fade[1],
-            default.translation_fade[2],
-        ]);
-        let scale = vec3_f32(&packet.scale).unwrap_or([
-            default.scale_phase[0],
-            default.scale_phase[1],
-            default.scale_phase[2],
-        ]);
-        SubmissionInstanceRow {
-            translation_fade: [
-                translation[0],
-                translation[1],
-                translation[2],
-                finite_clamped_f32(packet.fade, 1.0),
-            ],
-            rotation: quat_f32(&packet.rotation).unwrap_or(default.rotation),
-            scale_phase: [
-                scale[0],
-                scale[1],
-                scale[2],
-                finite_f32(packet.anim_phase, 0.0),
-            ],
-            ids: [
-                numeric_handle(&packet.mesh),
-                numeric_handle(&packet.material),
-                numeric_handle(&packet.anim_state),
-                packet_index,
-            ],
-        }
+        row_from_semantic(
+            &packet.translation,
+            &packet.rotation,
+            &packet.scale,
+            &packet.mesh,
+            &packet.material,
+            &packet.anim_state,
+            packet.anim_phase,
+            packet.fade,
+            packet_index,
+        )
+    }
+
+    /// 从 render-local 语义 packet 派生固定行。`packet_index` 回查
+    /// [`LocalSubmissionView::packets`]。
+    pub fn from_local_packet(packet: &RenderLocalPacket, packet_index: u32) -> Self {
+        row_from_semantic(
+            &packet.translation,
+            &packet.rotation,
+            &packet.scale,
+            &packet.mesh,
+            &packet.material,
+            &packet.anim_state,
+            packet.anim_phase,
+            packet.fade,
+            packet_index,
+        )
     }
 
     pub fn packet_index(&self) -> Option<usize> {
@@ -531,6 +542,56 @@ impl SubmissionView {
     }
 }
 
+/// render-local 临时实体提交视图。它与 [`SubmissionView`] 分开返回，避免 local id
+/// 与 sim [`InstanceId`] 混用；byte-row 派生仍复用同一固定 layout。
+#[derive(Debug, Clone, Default)]
+pub struct LocalSubmissionView {
+    pub packets: Vec<RenderLocalPacket>,
+}
+
+impl LocalSubmissionView {
+    pub fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, RenderLocalPacket> {
+        self.packets.iter()
+    }
+
+    pub fn instance_rows(&self) -> Vec<SubmissionInstanceRow> {
+        let mut rows = Vec::with_capacity(self.packets.len());
+        self.fill_instance_rows(&mut rows);
+        rows
+    }
+
+    pub fn fill_instance_rows(&self, out: &mut Vec<SubmissionInstanceRow>) {
+        out.clear();
+        out.reserve(self.packets.len());
+        for (i, packet) in self.packets.iter().enumerate() {
+            out.push(SubmissionInstanceRow::from_local_packet(
+                packet,
+                u32::try_from(i).unwrap_or(u32::MAX),
+            ));
+        }
+    }
+
+    pub fn instance_stream(&self) -> SubmissionInstanceStream {
+        let mut stream = SubmissionInstanceStream::default();
+        self.fill_instance_stream(&mut stream);
+        stream
+    }
+
+    pub fn fill_instance_stream(&self, out: &mut SubmissionInstanceStream) {
+        out.clear();
+        self.fill_instance_rows(&mut out.rows);
+        rebuild_spans(&out.rows, &mut out.spans);
+    }
+}
+
 /// 从一组渲染绑定装配提交视图。逐类型按注册序、类型内按 render 行序扫描存活
 /// （含淡出中的）实体，读绑定字段，剔除不可见 / 已淡尽者。
 ///
@@ -591,8 +652,57 @@ pub(super) fn assemble(
     SubmissionView { packets }
 }
 
+pub(super) fn assemble_local(
+    store: &LocalStore,
+    renderables: &[(RenderLocalTypeId, RenderBinding)],
+) -> LocalSubmissionView {
+    let mut packets = vec![];
+    for (ty, b) in renderables {
+        let mut ids = vec![];
+        store.for_each_live(*ty, |id| ids.push(id));
+        for local in ids {
+            if !store.is_present(local) {
+                continue;
+            }
+            if let Some(vf) = b.visibility
+                && matches!(store.read(local, vf), Value::Bool(false))
+            {
+                continue;
+            }
+            let fade = match b.fade {
+                None => 1.0,
+                Some(f) => match store.read(local, f).as_f64() {
+                    Some(v) if v.is_finite() => v.clamp(0.0, 1.0),
+                    _ => 0.0,
+                },
+            };
+            if fade <= 0.0 {
+                continue;
+            }
+            packets.push(RenderLocalPacket {
+                local,
+                translation: read_opt_local(store, local, b.translation),
+                rotation: read_opt_local(store, local, b.rotation),
+                scale: read_opt_local(store, local, b.scale),
+                mesh: read_opt_local(store, local, b.mesh),
+                material: read_opt_local(store, local, b.material),
+                anim_state: read_opt_local(store, local, b.anim_state),
+                anim_phase: b
+                    .anim_phase
+                    .map_or(0.0, |f| store.read(local, f).as_f64().unwrap_or(0.0)),
+                fade,
+            });
+        }
+    }
+    LocalSubmissionView { packets }
+}
+
 fn read_opt(store: &RenderStore, inst: InstanceId, f: Option<RFieldId>) -> Value {
     f.map_or(Value::Null, |f| store.read_render(inst, f))
+}
+
+fn read_opt_local(store: &LocalStore, local: RenderLocalId, f: Option<RFieldId>) -> Value {
+    f.map_or(Value::Null, |f| store.read(local, f))
 }
 
 fn rebuild_spans(rows: &[SubmissionInstanceRow], out: &mut Vec<SubmissionInstanceSpan>) {
@@ -628,6 +738,47 @@ fn write_f32<const N: usize>(v: f32, out: &mut [u8; N], offset: &mut usize) {
 fn write_u32<const N: usize>(v: u32, out: &mut [u8; N], offset: &mut usize) {
     out[*offset..*offset + 4].copy_from_slice(&v.to_le_bytes());
     *offset += 4;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn row_from_semantic(
+    translation_value: &Value,
+    rotation_value: &Value,
+    scale_value: &Value,
+    mesh: &Value,
+    material: &Value,
+    anim_state: &Value,
+    anim_phase: f64,
+    fade: f64,
+    packet_index: u32,
+) -> SubmissionInstanceRow {
+    let default = SubmissionInstanceRow::default();
+    let translation = vec3_f32(translation_value).unwrap_or([
+        default.translation_fade[0],
+        default.translation_fade[1],
+        default.translation_fade[2],
+    ]);
+    let scale = vec3_f32(scale_value).unwrap_or([
+        default.scale_phase[0],
+        default.scale_phase[1],
+        default.scale_phase[2],
+    ]);
+    SubmissionInstanceRow {
+        translation_fade: [
+            translation[0],
+            translation[1],
+            translation[2],
+            finite_clamped_f32(fade, 1.0),
+        ],
+        rotation: quat_f32(rotation_value).unwrap_or(default.rotation),
+        scale_phase: [scale[0], scale[1], scale[2], finite_f32(anim_phase, 0.0)],
+        ids: [
+            numeric_handle(mesh),
+            numeric_handle(material),
+            numeric_handle(anim_state),
+            packet_index,
+        ],
+    }
 }
 
 fn numeric_handle(v: &Value) -> u32 {

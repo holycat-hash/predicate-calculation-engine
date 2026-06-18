@@ -99,6 +99,9 @@ rt.register_calculation(
 
 跨实体攻击（`new.target = self` 注册期识别为等值快路，按 ref 点查）、
 fold 增量聚合、每帧 ECS 等完整用法见 [examples/demo.rs](examples/demo.rs)。
+render 侧动态帧率插值、staging 与阻尼示例见 [examples/render_demo.rs](examples/render_demo.rs)、
+[examples/render_staging.rs](examples/render_staging.rs) 与
+[examples/frame_rate_damping.rs](examples/frame_rate_damping.rs)。
 
 ## 优化
 
@@ -114,8 +117,8 @@ D2 买单，B 层自适应的遥测前提）。
 
 | 档位 | 入口 | 代价 |
 |---|---|---|
-| C1 执行档位 | `.tier(Tier::Kernel)` | 受限子集（禁 spawn 等动态分配），发散风险自负 |
-| C2 读集声明 | `.reads(["hp_max"])` | 声明负担；换热冷分离与预取精度 |
+| C1 执行档位 | `CalcOptions::default().tier(Tier::Kernel).kernel_ir(ir)` | 受限、可机检的 IR 子集；发散风险自负 |
+| C2 读集声明 | `.reads(vec![hp_max])` | 声明负担；换热冷分离与预取精度 |
 | C3 驻留划分 | `.residency(Residency::Gpu)` | pin 无静态正解，配合 profile + 滞回 |
 | C4 确定性 | `rt.set_determinism(Canonical)` | batch 规范序排序成本；lockstep/回放买单 |
 | C5 检测档位 | `rt.set_detect(Strict/Warn/Silent)` | Strict/Warn 污染热路径；默认跟随构建档 |
@@ -125,6 +128,7 @@ D2 买单，B 层自适应的遥测前提）。
 
 ```powershell
 cargo run --example demo   # §7 示例 1+2+4：攻击数据流、边沿触发、增量聚合
+cargo run --example frame_rate_damping  # render continuous：按真实 dt 做帧率无关阻尼
 cargo test                 # 场景用例 + 核心 API / 优化行为验证
 cargo test --features parallel   # 执行阶段并行（rayon）下的同一套测试
 ```
@@ -146,6 +150,7 @@ src/
   render/            # 派生消费者 runtime（第二个 runtime，动态帧率，单向消费 sim 写流）
   spatial.rs         # 物化索引 helper（均匀网格，§6.1 模式的随附工具，非核心层）
 examples/demo.rs     # 纯库核心 API 完整示例
+examples/render_*.rs # 派生 render runtime 示例（含帧率无关阻尼）
 docs-zh/
   PCE文档.md          # 架构总纲（四层抽象、帧模型、成本模型、不变量、派生 runtime）
   original-api-shape.rs # 原始 API 形态说明（教学参考，不参与库编译）
@@ -172,6 +177,7 @@ cargo test
 0.1.0，纯库 crate（默认零第三方依赖；`parallel` feature 引入 rayon）。
 §4 成本表的索引绑定已逐项落地（own/inst 哈希链、值桶、共享阈值表、fold
 增量、合取闩），A 层白送优化全部生效，C 层档位入口全部暴露；23 篇场景
-文档的集成测试 + 核心 API/优化行为测试构成回归网。SIMD kernel 代码生成与 GPU
-驻留 backend 属 C1/C3 的后端实现，结构（列存、阈值表、Tier/Residency
-标注、profiler 边权遥测）已就位，留待接入。
+文档的集成测试 + 核心 API/优化行为测试构成回归网。Kernel IR 第 1-4 步已落地
+（`KernelIr` / `KernelOp`、`Tier::Kernel` 注册期校验、SoA `KernelColumn` 批执行、
+可插拔 `KernelBackend` 选择与默认 `ScalarKernelBackend`）。SIMD kernel 代码生成与
+GPU 驻留 backend 属可选 C1/C3 后端实现。

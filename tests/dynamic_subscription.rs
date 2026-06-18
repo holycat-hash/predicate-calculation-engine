@@ -151,7 +151,10 @@ fn setup() -> (Runtime, W) {
         &[seen_count, seen_size],
         Box::new(move |ctx, input| {
             let Input::Each(row) = input else { return };
-            ctx.write(seen_count, Value::Int(as_i64(&ctx.read_own(seen_count)) + 1));
+            ctx.write(
+                seen_count,
+                Value::Int(as_i64(&ctx.read_own(seen_count)) + 1),
+            );
             ctx.write(seen_size, Value::Int(map_of(&row[0]).len() as i64));
         }),
     )
@@ -226,4 +229,108 @@ fn inst_subscription_follows_my_cell_ref_after_movement() {
     assert_eq!(seen(&rt, a, w), (3, 2));
     assert_eq!(seen(&rt, c, w), (1, 2));
     assert_eq!(seen(&rt, b, w), (2, 1));
+}
+
+#[test]
+fn inst_rebind_routes_against_previous_ref_snapshot() {
+    let mut rt = Runtime::new();
+    let target_ty = rt.register_entity_type(
+        "Target",
+        vec![FieldDef::new("watched", Value::Int(0))],
+        false,
+    );
+    let watched = rt.field(target_ty, "watched");
+    let holder_ty = rt.register_entity_type(
+        "Holder",
+        vec![
+            FieldDef::reference("target"),
+            FieldDef::new("seen", Value::Int(0)),
+        ],
+        false,
+    );
+    let target = rt.field(holder_ty, "target");
+    let seen = rt.field(holder_ty, "seen");
+
+    rt.register_calculation(
+        "watch_target",
+        holder_ty,
+        Predicate::new(
+            inst(target, watched),
+            Cond::True,
+            Delivery::Each(vec![Proj::New(vec![])]),
+        ),
+        &[seen],
+        Box::new(move |ctx, input| ctx.write(seen, input.arg(0).clone())),
+    )
+    .unwrap();
+
+    let a = rt.spawn(target_ty, vec![]);
+    let b = rt.spawn(target_ty, vec![]);
+    let h = rt.spawn(holder_ty, vec![(target, Value::Ref(a))]);
+    rt.step();
+
+    rt.debug_write(h, target, Value::Ref(b));
+    rt.debug_write(a, watched, Value::Int(11));
+    rt.step();
+    assert_eq!(
+        rt.read(h, seen),
+        Value::Int(11),
+        "old target writes in the rebind frame still route to the previous subscriber"
+    );
+
+    rt.debug_write(b, watched, Value::Int(22));
+    rt.step();
+    assert_eq!(
+        rt.read(h, seen),
+        Value::Int(22),
+        "new target writes route after the ref write has had one frame to become the subscription"
+    );
+}
+
+#[test]
+fn inst_rebind_does_not_route_new_target_in_same_write_set() {
+    let mut rt = Runtime::new();
+    let target_ty = rt.register_entity_type(
+        "Target",
+        vec![FieldDef::new("watched", Value::Int(0))],
+        false,
+    );
+    let watched = rt.field(target_ty, "watched");
+    let holder_ty = rt.register_entity_type(
+        "Holder",
+        vec![
+            FieldDef::reference("target"),
+            FieldDef::new("seen", Value::Int(0)),
+        ],
+        false,
+    );
+    let target = rt.field(holder_ty, "target");
+    let seen = rt.field(holder_ty, "seen");
+
+    rt.register_calculation(
+        "watch_target",
+        holder_ty,
+        Predicate::new(
+            inst(target, watched),
+            Cond::True,
+            Delivery::Each(vec![Proj::New(vec![])]),
+        ),
+        &[seen],
+        Box::new(move |ctx, input| ctx.write(seen, input.arg(0).clone())),
+    )
+    .unwrap();
+
+    let a = rt.spawn(target_ty, vec![]);
+    let b = rt.spawn(target_ty, vec![]);
+    let h = rt.spawn(holder_ty, vec![(target, Value::Ref(a))]);
+    rt.step();
+
+    rt.debug_write(h, target, Value::Ref(b));
+    rt.debug_write(b, watched, Value::Int(22));
+    rt.step();
+    assert_eq!(
+        rt.read(h, seen),
+        Value::Int(0),
+        "new target writes in the rebind frame must not route early"
+    );
 }

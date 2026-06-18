@@ -58,8 +58,8 @@
 //!
 //! | 档位 | 入口 | 代价 |
 //! |---|---|---|
-//! | C1 执行档位 | [`runtime::Tier`] / `.tier(Kernel)` | 表达力受限 + 发散风险自负 |
-//! | C2 读集声明 | `.reads([...])` | 声明负担；不声明退化为 profile 猜测 |
+//! | C1 执行档位 | [`runtime::Tier`] / `.tier(Tier::Kernel).kernel_ir(ir)` | 表达力受限；IR 子集可机检 |
+//! | C2 读集声明 | `.reads(vec![field])` | 声明负担；不声明退化为 profile 猜测 |
 //! | C3 驻留划分 | [`runtime::Residency`] / `.residency(...)` | 没有静态正解，pin 自负 |
 //! | C4 确定性 | [`runtime::Determinism`] / `set_determinism` | 规范序的排序成本 |
 //! | C5 检测档位 | [`runtime::Detect`] / `set_detect` | Strict/Warn 污染热路径 |
@@ -79,14 +79,18 @@ pub mod runtime;
 pub mod spatial;
 pub mod value;
 
-pub use calculation::{CalcId, Ctx, Input};
+pub use calculation::{
+    CalcId, Ctx, Input, KernelBackend, KernelBatch, KernelBatchOutput, KernelColumn,
+    KernelColumnWrite, KernelIr, KernelOp, KernelWrite, ScalarKernelBackend,
+};
 pub use entity::{CellAddr, EntityTypeId, FieldDef, FieldId, InstanceId};
 pub use predicate::{CmpOp, Cond, Delivery, Dir, Expr, FoldOp, Predicate, Proj, Scope, ValRef};
 pub use render::{
-    lod_band, Axes, CullShape, Interp, Publisher, RFieldId, RenderBinding, RenderClock, RenderCtx,
-    RenderInput, RenderPacket, RenderRuntime, SimFrame, SubmissionInstanceKey,
-    SubmissionInstanceLayout, SubmissionInstanceRow, SubmissionInstanceSlot, SubmissionInstanceSpan,
-    SubmissionInstanceStream, SubmissionView,
+    Axes, CullShape, Interp, LocalSubmissionView, Publisher, RFieldId, RenderBinding, RenderClock,
+    RenderCtx, RenderInput, RenderLocalCtx, RenderLocalFieldDef, RenderLocalId, RenderLocalPacket,
+    RenderLocalTypeId, RenderPacket, RenderRuntime, SimFrame, SubmissionInstanceKey,
+    SubmissionInstanceLayout, SubmissionInstanceRow, SubmissionInstanceSlot,
+    SubmissionInstanceSpan, SubmissionInstanceStream, SubmissionView, lod_band,
 };
 pub use runtime::{
     CalcOptions, Detect, Determinism, Profile, Residency, RowPolicy, Runtime, Schedule,

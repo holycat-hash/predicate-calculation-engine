@@ -33,7 +33,10 @@ fn map_of(v: &Value) -> BTreeMap<String, Value> {
 }
 
 fn scope_or(scopes: Vec<Scope>) -> Scope {
-    scopes.into_iter().reduce(|a, b| Scope::Or(Box::new(a), Box::new(b))).unwrap()
+    scopes
+        .into_iter()
+        .reduce(|a, b| Scope::Or(Box::new(a), Box::new(b)))
+        .unwrap()
 }
 
 /// 把 src（物品计数表）并入 dst。
@@ -49,7 +52,9 @@ fn merge_into(dst: &mut BTreeMap<String, Value>, src: &Value) {
 /// 从 dst 扣除 src；不足则一件不动返回 false（check 与 act 同一次运行）。
 fn take_from(dst: &mut BTreeMap<String, Value>, src: &Value) -> bool {
     let Value::Map(m) = src else { return false };
-    if m.iter().any(|(k, v)| as_i64(dst.get(k).unwrap_or(&Value::Int(0))) < as_i64(v)) {
+    if m.iter()
+        .any(|(k, v)| as_i64(dst.get(k).unwrap_or(&Value::Int(0))) < as_i64(v))
+    {
         return false;
     }
     for (k, v) in m {
@@ -134,12 +139,18 @@ fn setup() -> (Runtime, W) {
         Predicate::new(
             scope_or(vec![type_scope(player_ty, p_trade_out), own(f_a), own(f_b)]),
             Cond::Or(
-                Box::new(Cond::Cmp(new_path(&["trade"]), CmpOp::Eq, Expr::Val(ValRef::SelfRef))),
+                Box::new(Cond::Cmp(
+                    new_path(&["trade"]),
+                    CmpOp::Eq,
+                    Expr::Val(ValRef::SelfRef),
+                )),
                 Box::new(Cond::Became(Value::Null)),
             ),
             Delivery::Batch(vec![Proj::New(vec![])]),
         ),
-        &[t_offer_a, t_offer_b, f_gen, t_conf_a, t_conf_b, f_state, f_verdict],
+        &[
+            t_offer_a, t_offer_b, f_gen, t_conf_a, t_conf_b, f_state, f_verdict,
+        ],
         Box::new(move |ctx, input| {
             let Input::Batch(rows) = input else { return };
             if as_str(&ctx.read_own(f_state)) != "open" {
@@ -190,14 +201,12 @@ fn setup() -> (Runtime, W) {
                         aborted = true;
                         break;
                     }
-                    "confirm" => {
+                    "confirm" if cur_gen > 0 && as_i64(&path(&op, "gen")) == cur_gen => {
                         // 确认携带它基于的代次：与当前代次相符才算数
-                        if cur_gen > 0 && as_i64(&path(&op, "gen")) == cur_gen {
-                            if who == a {
-                                conf_a = Value::Int(cur_gen);
-                            } else if who == b {
-                                conf_b = Value::Int(cur_gen);
-                            }
+                        if who == a {
+                            conf_a = Value::Int(cur_gen);
+                        } else if who == b {
+                            conf_b = Value::Int(cur_gen);
                         }
                     }
                     _ => {}
@@ -209,7 +218,8 @@ fn setup() -> (Runtime, W) {
                     Value::map([("kind", Value::str("abort")), ("gen", Value::Int(cur_gen))]),
                 );
                 ctx.write(f_state, Value::str("done"));
-            } else if cur_gen > 0 && conf_a == Value::Int(cur_gen) && conf_b == Value::Int(cur_gen) {
+            } else if cur_gen > 0 && conf_a == Value::Int(cur_gen) && conf_b == Value::Int(cur_gen)
+            {
                 // 单值判决：两个方向的支付在同一个值快照里，双方同帧各取半边
                 ctx.write(
                     f_verdict,
@@ -267,7 +277,11 @@ fn setup() -> (Runtime, W) {
                         if g > applied {
                             applied = g; // 幂等：同一判决至多应用一次
                             let me_a = path(&op, "a") == Value::Ref(ctx.self_id());
-                            let recv = if me_a { path(&op, "to_a") } else { path(&op, "to_b") };
+                            let recv = if me_a {
+                                path(&op, "to_a")
+                            } else {
+                                path(&op, "to_b")
+                            };
                             escrow.clear(); // 我押的货已易主（对方经同一判决收取）
                             merge_into(&mut items, &recv);
                             pending = Value::Null;
@@ -335,7 +349,11 @@ fn setup() -> (Runtime, W) {
     rt.register_calculation(
         "reclaim_probe",
         player_ty,
-        Predicate::new(own(w.p_pending), Cond::Became(Value::Null), Delivery::Each(vec![])),
+        Predicate::new(
+            own(w.p_pending),
+            Cond::Became(Value::Null),
+            Delivery::Each(vec![]),
+        ),
         &[p_reclaim],
         Box::new(move |ctx, _| {
             ctx.write(p_reclaim, Value::map([("kind", Value::str("reclaim"))]));
@@ -382,10 +400,18 @@ fn cmd_cancel(trade: InstanceId, seq: i64) -> Value {
     ])
 }
 
-fn spawn_pair(rt: &mut Runtime, w: &W, a_items: Value, b_items: Value) -> (InstanceId, InstanceId, InstanceId) {
+fn spawn_pair(
+    rt: &mut Runtime,
+    w: &W,
+    a_items: Value,
+    b_items: Value,
+) -> (InstanceId, InstanceId, InstanceId) {
     let a = rt.spawn(w.player_ty, vec![(w.p_items, a_items)]);
     let b = rt.spawn(w.player_ty, vec![(w.p_items, b_items)]);
-    let t = rt.spawn(w.trade_ty, vec![(w.t_a, Value::Ref(a)), (w.t_b, Value::Ref(b))]);
+    let t = rt.spawn(
+        w.trade_ty,
+        vec![(w.t_a, Value::Ref(a)), (w.t_b, Value::Ref(b))],
+    );
     (a, b, t)
 }
 
@@ -401,11 +427,21 @@ fn total(rt: &Runtime, players: &[InstanceId], w: &W, item: &str) -> i64 {
 }
 
 /// 推进 n 帧，每个帧边界检查守恒式。
-fn step_conserved(rt: &mut Runtime, players: &[InstanceId], w: &W, n: usize, expect: &[(&str, i64)]) {
+fn step_conserved(
+    rt: &mut Runtime,
+    players: &[InstanceId],
+    w: &W,
+    n: usize,
+    expect: &[(&str, i64)],
+) {
     for _ in 0..n {
         rt.step();
         for (item, amount) in expect {
-            assert_eq!(total(rt, players, w, item), *amount, "{item} 总量在帧边界破坏守恒");
+            assert_eq!(
+                total(rt, players, w, item),
+                *amount,
+                "{item} 总量在帧边界破坏守恒"
+            );
         }
     }
 }
@@ -464,7 +500,10 @@ fn offer_swap_invalidates_stale_confirm_even_same_frame() {
     assert_eq!(as_i64(&rt.read(t, w.t_gen)), 3);
     assert_eq!(item_count(&rt, a, &w, "sword"), 1); // sword 退押回手
     assert_eq!(as_i64(&path(&rt.read(a, w.p_escrow), "rock")), 1);
-    assert_eq!(item_count(&rt, b, &w, "gold") + as_i64(&path(&rt.read(b, w.p_escrow), "gold")), 100);
+    assert_eq!(
+        item_count(&rt, b, &w, "gold") + as_i64(&path(&rt.read(b, w.p_escrow), "gold")),
+        100
+    );
 
     // 基于新代次重新双确认：按 B 实际看到的 rock 成交，机制不死锁
     rt.debug_write(b, w.p_cmd, cmd_confirm(t, 3, 5));

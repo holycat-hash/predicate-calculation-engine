@@ -58,8 +58,11 @@ fn setup() -> (Runtime, EntityTypeId, EntityTypeId, F) {
         ],
         false,
     );
-    let attacker =
-        rt.register_entity_type("Attacker", vec![FieldDef::new("attack_out", Value::Null)], false);
+    let attacker = rt.register_entity_type(
+        "Attacker",
+        vec![FieldDef::new("attack_out", Value::Null)],
+        false,
+    );
     let f = F {
         pace_req: rt.field(body, "pace_req"),
         stop_req: rt.field(body, "stop_req"),
@@ -87,7 +90,11 @@ fn setup() -> (Runtime, EntityTypeId, EntityTypeId, F) {
     rt.register_calculation(
         "timekeeper",
         body,
-        Predicate::new(type_scope(clock_ty, clock_frame), Cond::True, Delivery::Each(vec![])),
+        Predicate::new(
+            type_scope(clock_ty, clock_frame),
+            Cond::True,
+            Delivery::Each(vec![]),
+        ),
         &[f_local, f_acc, f_num, f_den, f_pseq, f_freeze, f_sseq],
         Box::new(move |ctx, _| {
             let mut local = as_i64(&ctx.read_own(f_local));
@@ -175,7 +182,11 @@ fn setup() -> (Runtime, EntityTypeId, EntityTypeId, F) {
         Predicate::new(
             type_scope(attacker, f.attack_out),
             Cond::And(
-                Box::new(Cond::Cmp(new_path(&["target"]), CmpOp::Eq, Expr::Val(ValRef::SelfRef))),
+                Box::new(Cond::Cmp(
+                    new_path(&["target"]),
+                    CmpOp::Eq,
+                    Expr::Val(ValRef::SelfRef),
+                )),
                 Box::new(Cond::Cmp(own_field(f_local), CmpOp::Ge, own_field(f_inv))),
             ),
             Delivery::Batch(vec![Proj::New(vec!["dmg".to_string()])]),
@@ -244,7 +255,11 @@ fn slow_motion_advances_local_axis_fractionally() {
     rt.debug_write(
         p,
         f.pace_req,
-        Value::map([("num", Value::Int(1)), ("den", Value::Int(2)), ("seq", Value::Int(1))]),
+        Value::map([
+            ("num", Value::Int(1)),
+            ("den", Value::Int(2)),
+            ("seq", Value::Int(1)),
+        ]),
     );
     step_n(&mut rt, 20); // 半速：整数分数累加，恰好走 10
     assert_eq!(local(&rt, p, &f), 10);
@@ -252,7 +267,11 @@ fn slow_motion_advances_local_axis_fractionally() {
     rt.debug_write(
         p,
         f.pace_req,
-        Value::map([("num", Value::Int(1)), ("den", Value::Int(1)), ("seq", Value::Int(2))]),
+        Value::map([
+            ("num", Value::Int(1)),
+            ("den", Value::Int(1)),
+            ("seq", Value::Int(2)),
+        ]),
     );
     step_n(&mut rt, 10); // 复速只改导数（未来推进），不重写历史戳
     assert_eq!(local(&rt, p, &f), 20);

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use pce::predicate::{lit, new_path, own, type_scope};
 use pce::{
     CmpOp, Cond, Delivery, EntityTypeId, Expr, FieldDef, FieldId, Input, InstanceId, Predicate,
-    Proj, Runtime, Value, ValRef,
+    Proj, Runtime, ValRef, Value,
 };
 
 fn target_is_self(path: &[&str]) -> Cond {
@@ -121,7 +121,11 @@ fn setup() -> (Runtime, W) {
     rt.register_calculation(
         "xp_split",
         party_ty,
-        Predicate::new(own(w.p_kill_in), Cond::True, Delivery::Batch(vec![Proj::New(vec![])])),
+        Predicate::new(
+            own(w.p_kill_in),
+            Cond::True,
+            Delivery::Batch(vec![Proj::New(vec![])]),
+        ),
         &[],
         Box::new(move |ctx, input| {
             let Input::Batch(rows) = input else { return };
@@ -274,7 +278,10 @@ fn setup() -> (Runtime, W) {
             let mut best: Option<(i64, String, Value)> = None;
             for (salt, entry) in rolls {
                 let key = (as_i64(&path(&entry, "roll")), salt);
-                if best.as_ref().map_or(true, |(r, s, _)| (key.0, &key.1) > (*r, s)) {
+                if best
+                    .as_ref()
+                    .is_none_or(|(r, s, _)| (key.0, &key.1) > (*r, s))
+                {
                     best = Some((key.0, key.1, path(&entry, "member")));
                 }
             }
@@ -329,7 +336,10 @@ fn integer_split_conserves_total_with_remainder() {
     rt.step(); // 分账 + spawn Award
     rt.step(); // 成员领取
 
-    let xs: Vec<i64> = members.iter().map(|m| as_i64(&rt.read(*m, w.m_xp))).collect();
+    let xs: Vec<i64> = members
+        .iter()
+        .map(|m| as_i64(&rt.read(*m, w.m_xp)))
+        .collect();
     // 100 = 33×3 + 1：余数按 slot 全序落给第一名，不丢不复制
     assert_eq!(xs, vec![34, 33, 33]);
     assert_eq!(xs.iter().sum::<i64>(), 100);
@@ -364,8 +374,8 @@ fn round_robin_cursor_advances_k_slots_in_one_batch() {
     rt.step();
     rt.step();
 
-    assert_eq!(map_of(&rt.read(members[0], w.m_bag)).contains_key("sword"), true);
-    assert_eq!(map_of(&rt.read(members[1], w.m_bag)).contains_key("shield"), true);
+    assert!(map_of(&rt.read(members[0], w.m_bag)).contains_key("sword"));
+    assert!(map_of(&rt.read(members[1], w.m_bag)).contains_key("shield"));
     assert!(map_of(&rt.read(members[2], w.m_bag)).is_empty());
     assert_eq!(as_i64(&rt.read(party, w.p_rr_cursor)), 2);
 
@@ -381,7 +391,7 @@ fn round_robin_cursor_advances_k_slots_in_one_batch() {
     );
     rt.step();
     rt.step();
-    assert_eq!(map_of(&rt.read(members[2], w.m_bag)).contains_key("potion"), true);
+    assert!(map_of(&rt.read(members[2], w.m_bag)).contains_key("potion"));
     assert_eq!(as_i64(&rt.read(party, w.p_rr_cursor)), 3);
 }
 

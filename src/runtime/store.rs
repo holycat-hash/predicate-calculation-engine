@@ -19,11 +19,13 @@
 //! 行身份策略（C6，开发者每 type 二选一）：
 //! - [`RowPolicy::Stable`]：零间接重映射、死亡留洞（洞可复用），行号终生不变；
 //! - [`RowPolicy::Compact`]：行恒稠密，死亡时 swap-remove 重映射，遍历最快。
+//!
 //! 鱼与熊掌结构性不可兼得，按 churn 特征选。
 //!
 //! 诚实条款：id 复用 + 代际号意味着每次访问至少一次间接（id→row）与一次
 //! 代际比较——这是「无指针」的固定税，两种策略都付。
 
+use crate::calculation::{KernelColumn, KernelColumnSource, SnapshotRead};
 use crate::column::Column;
 use crate::entity::{EntityTypeId, FIELD_ALIVE, FieldDef, FieldId, InstanceId};
 use crate::genslots::GenSlots;
@@ -176,8 +178,8 @@ impl Store {
         let t = &self.types[ty.0 as usize];
         match t.cols[FIELD_ALIVE.0 as usize].as_bool_slice() {
             Some(alive) => {
-                for r in 0..t.row_id.len() {
-                    if t.slots.is_live(r) && alive[r] {
+                for (r, alive) in alive.iter().enumerate().take(t.row_id.len()) {
+                    if t.slots.is_live(r) && *alive {
                         f(InstanceId {
                             ty,
                             id: t.row_id[r],
@@ -291,6 +293,53 @@ impl Store {
                     let moved_id = t.row_id[r] as usize;
                     t.id_slot[moved_id].row = r as u32;
                 }
+            }
+        }
+    }
+}
+
+impl SnapshotRead for Store {
+    fn read(&self, inst: InstanceId, field: FieldId) -> Value {
+        Store::read(self, inst, field)
+    }
+}
+
+impl KernelColumnSource for Store {
+    fn read_own_column(&self, lanes: &[InstanceId], field: FieldId) -> KernelColumn {
+        let Some(first) = lanes.first() else {
+            return KernelColumn::Boxed(vec![]);
+        };
+        let Some((ty_index, first_row)) = self.row_of(*first) else {
+            return KernelColumn::from_values(
+                lanes.iter().map(|&lane| self.read(lane, field)).collect(),
+            );
+        };
+        let mut rows = Vec::with_capacity(lanes.len());
+        rows.push(first_row);
+        for &lane in &lanes[1..] {
+            match self.row_of(lane) {
+                Some((ti, row)) if ti == ty_index => rows.push(row),
+                _ => {
+                    return KernelColumn::from_values(
+                        lanes.iter().map(|&lane| self.read(lane, field)).collect(),
+                    );
+                }
+            }
+        }
+
+        let Some(col) = self.types[ty_index].cols.get(field.0 as usize) else {
+            return KernelColumn::from_values(
+                lanes.iter().map(|&lane| self.read(lane, field)).collect(),
+            );
+        };
+        match col {
+            Column::Bool(c) => KernelColumn::Bool(rows.iter().map(|&r| c[r]).collect()),
+            Column::Int(c) => KernelColumn::Int(rows.iter().map(|&r| c[r]).collect()),
+            Column::Float(c) => KernelColumn::Float(rows.iter().map(|&r| c[r]).collect()),
+            Column::Vec3(c) => KernelColumn::Vec3(rows.iter().map(|&r| c[r]).collect()),
+            Column::Quat(c) => KernelColumn::Quat(rows.iter().map(|&r| c[r]).collect()),
+            Column::Boxed(c) => {
+                KernelColumn::from_values(rows.iter().map(|&r| c[r].clone()).collect())
             }
         }
     }

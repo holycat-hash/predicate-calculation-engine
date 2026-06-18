@@ -98,6 +98,7 @@ rt.register_calculation(
 ```
 
 For cross-entity attacks (`new.target = self`, compiled into an equality fast path by ref lookup), fold-based incremental aggregation, and per-frame ECS-style systems, see [examples/demo.rs](examples/demo.rs).
+For render-side dynamic-frame-rate interpolation and damping, see [examples/render_demo.rs](examples/render_demo.rs), [examples/render_staging.rs](examples/render_staging.rs), and [examples/frame_rate_damping.rs](examples/frame_rate_damping.rs).
 
 ## Optimizations
 
@@ -107,8 +108,8 @@ For cross-entity attacks (`new.target = self`, compiled into an equality fast pa
 
 | Tier | Entry Point | Cost |
 |---|---|---|
-| C1 Execution tier | `.tier(Tier::Kernel)` | Restricted subset; divergence risk is on the caller |
-| C2 Read-set declaration | `.reads(["hp_max"])` | Declaration burden; buys hot/cold separation and more precise prefetching |
+| C1 Execution tier | `CalcOptions::default().tier(Tier::Kernel).kernel_ir(ir)` | Restricted, machine-checkable IR subset; divergence risk is on the caller |
+| C2 Read-set declaration | `.reads(vec![hp_max])` | Declaration burden; buys hot/cold separation and more precise prefetching |
 | C3 Residency pinning | `.residency(Residency::Gpu)` | No static perfect answer; pair with profiling and hysteresis |
 | C4 Determinism | `rt.set_determinism(Canonical)` | Canonical batch ordering cost; useful for lockstep/replay |
 | C5 Detection tier | `rt.set_detect(Strict/Warn/Silent)` | Strict/Warn can pollute the hot path; default follows build mode |
@@ -118,6 +119,7 @@ For cross-entity attacks (`new.target = self`, compiled into an equality fast pa
 
 ```powershell
 cargo run --example demo          # Section 7 examples 1 + 2 + 4
+cargo run --example frame_rate_damping  # Render continuous damping with real dt
 cargo test                        # Scenario tests plus core API / optimization behavior
 cargo test --features parallel    # The same test set with rayon-backed execution-stage parallelism
 ```
@@ -139,6 +141,7 @@ src/
   render/            # Derived consumer runtime: dynamic frame rate, consumes sim writes one-way
   spatial.rs         # Materialized-index helper: uniform grid for the Section 6.1 pattern
 examples/demo.rs     # Complete pure-library core API example
+examples/render_*.rs # Derived render runtime examples, including frame-rate damping
 docs/
   PCE.md             # Architecture guide: invariants, derived runtime, and cost model
   README.md          # Scenario-method index
@@ -169,4 +172,4 @@ cargo test
 
 Version `0.1.0`, pure library crate, unpublished. The default build has no third-party dependencies; the optional `parallel` feature enables rayon for execution-stage parallelism.
 
-The Section 4 cost-table index bindings are implemented across the runtime: own/inst hash chains, value buckets, shared threshold tables, incremental folds, and conjunction latches. Always-on Layer A optimizations are active, Layer C tier entry points are exposed, and the 23 scenario integration tests plus core API / optimization behavior tests form the current regression net. SIMD kernel code generation and GPU-residency backends remain future C1/C3 backend work; the structural hooks are already present through column storage, threshold tables, `Tier`/`Residency` annotations, and profiler edge telemetry.
+The Section 4 cost-table index bindings are implemented across the runtime: own/inst hash chains, value buckets, shared threshold tables, incremental folds, and conjunction latches. Always-on Layer A optimizations are active, Layer C tier entry points are exposed, and the 23 scenario integration tests plus core API / optimization behavior tests form the current regression net. Kernel IR Steps 1-4 are implemented (`KernelIr` / `KernelOp`, `Tier::Kernel` registration-time validation, SoA `KernelColumn` batch execution, and pluggable `KernelBackend` selection with a default `ScalarKernelBackend`). SIMD kernel code generation and GPU-residency backends remain optional C1/C3 backend work.

@@ -23,11 +23,18 @@ struct W {
 
 fn setup() -> (Runtime, W) {
     let mut rt = Runtime::new();
-    let unit_ty = rt.register_entity_type("Unit", vec![FieldDef::new("hp", Value::Int(100))], false);
-    let attacker_ty =
-        rt.register_entity_type("Attacker", vec![FieldDef::new("attack_out", Value::Null)], false);
-    let healer_ty =
-        rt.register_entity_type("Healer", vec![FieldDef::new("heal_out", Value::Null)], false);
+    let unit_ty =
+        rt.register_entity_type("Unit", vec![FieldDef::new("hp", Value::Int(100))], false);
+    let attacker_ty = rt.register_entity_type(
+        "Attacker",
+        vec![FieldDef::new("attack_out", Value::Null)],
+        false,
+    );
+    let healer_ty = rt.register_entity_type(
+        "Healer",
+        vec![FieldDef::new("heal_out", Value::Null)],
+        false,
+    );
     let w = W {
         unit_ty,
         attacker_ty,

@@ -31,12 +31,15 @@ mod route;
 mod store;
 
 /// render 复用 sim 的谓词求值器 / 投影（条件评估单一真源，render 不再 fork）。
-pub(crate) use route::{CompiledCond, project_ro};
+pub(crate) use route::{CompiledCond, CompiledProj, project_ro};
 pub use store::{RowPolicy, Store};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::calculation::{CalcFn, CalcId, Ctx, Input};
+use crate::calculation::{
+    CalcFn, CalcId, Ctx, Input, KernelBackend, KernelBatch, KernelBatchOutput, KernelInputShape,
+    KernelIr, ScalarKernelBackend,
+};
 use crate::entity::{CellAddr, EntityTypeId, FIELD_ALIVE, FieldDef, FieldId, InstanceId};
 use crate::predicate::{Cond, Delivery, Predicate, Scope};
 use crate::value::Value;
@@ -54,10 +57,18 @@ pub struct WriteRec {
     pub new: Value,
 }
 
+type CalcWrites = Vec<(FieldId, Value)>;
+type SpawnInit = Vec<(FieldId, Value)>;
+type SpawnRequests = Vec<(EntityTypeId, SpawnInit)>;
+type RunOneOutput = (CalcWrites, SpawnRequests);
+type RunTriggersOutput = (Vec<WriteRec>, SpawnRequests);
+type RefReverse = HashMap<InstanceId, HashSet<(InstanceId, FieldId)>>;
+
 // ---- 开发者档位（C 层）----
 
 /// C1 执行档位。合法性（无竞争、快照一致）是白送的；收益性要求 calc 体落在
-/// 可编译受限子集内——runtime 看不穿图灵完备代码，必须开发者标注。
+/// 可编译受限子集内。`General` 闭包仍是图灵完备代码；`Kernel` 必须提供
+/// [`KernelIr`]，由 runtime 在注册期机检并经 [`KernelBackend`] 批执行。
 /// 这是 §3.5 准入标准的镜像定理：从谓词词汇换到执行层，同一原则。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tier {
@@ -65,8 +76,8 @@ pub enum Tier {
     #[default]
     General,
     /// 受限 kernel 子集：无动态分配（`spawn` 被禁）、宜无分支发散。
-    /// 代价：表达力受限 + 发散风险自负。backend 可据此把执行批入
-    /// SIMD/GPU kernel；本实现强制 spawn 禁令并保留标注供调度。
+    /// 代价：表达力受限 + 发散风险自负。注册时必须提供 [`KernelIr`]；
+    /// 本实现用默认 SoA scalar backend 执行，后续 SIMD/GPU backend 可消费同一 IR。
     Kernel,
 }
 
@@ -104,7 +115,7 @@ pub enum Detect {
     Strict,
     /// 同上,但仅 eprintln 告警。
     Warn,
-    /// 静默折叠（§8 开放问题四的 release 答案）。
+    /// 静默折叠（§2 检测档位 Detect 的 release 默认）。
     Silent,
 }
 
@@ -129,6 +140,31 @@ pub struct CalcOptions {
     pub tier: Tier,
     /// C3 驻留 pin。
     pub residency: Residency,
+    /// 执行层 kernel IR。提供时执行走 kernel backend；否则走闭包兜底。
+    /// `Tier::Kernel` 要求此字段为 `Some`，从注册期开始机检 C1/D4。
+    pub kernel_ir: Option<KernelIr>,
+}
+
+impl CalcOptions {
+    pub fn reads(mut self, reads: impl Into<Vec<FieldId>>) -> Self {
+        self.reads = Some(reads.into());
+        self
+    }
+
+    pub fn tier(mut self, tier: Tier) -> Self {
+        self.tier = tier;
+        self
+    }
+
+    pub fn residency(mut self, residency: Residency) -> Self {
+        self.residency = residency;
+        self
+    }
+
+    pub fn kernel_ir(mut self, ir: KernelIr) -> Self {
+        self.kernel_ir = Some(ir);
+        self
+    }
 }
 
 // ---- 免费 profiler（白送优化，D2 买单）----
@@ -227,6 +263,8 @@ pub(crate) struct RegisteredCalc {
     pub cond_class: u32,
     /// 谓词预编译产物（白送优化）：扁平后缀程序，运行期紧循环求值。
     pub compiled: route::CompiledCond,
+    /// 投影注册期编译形（含 OQ2 算术投影）；与 `pred.delivery` 的 projs 一一对应。
+    pub proj_compiled: Vec<route::CompiledProj>,
     pub declared_writes: HashSet<FieldId>,
     pub opts: CalcOptions,
     pub f: CalcFn,
@@ -314,6 +352,8 @@ pub struct Runtime {
     profile: Profile,
     /// C1/C2/C3 上游集成：上一帧解析出的执行计划（按 calc 分组 + 驻留分区）。
     schedule: Schedule,
+    /// Kernel IR 后端列表。前面的后端优先，最后保留 core 的 scalar SoA fallback。
+    kernel_backends: Vec<Box<dyn KernelBackend>>,
     detect: Detect,
     determinism: Determinism,
     clock: clock::Clock,
@@ -340,6 +380,7 @@ impl Runtime {
             scratch: route::Scratch::default(),
             profile: Profile::default(),
             schedule: Schedule::default(),
+            kernel_backends: vec![Box::new(ScalarKernelBackend)],
             detect: Detect::default(),
             determinism: Determinism::default(),
             clock: clock::Clock::placeholder(),
@@ -385,6 +426,17 @@ impl Runtime {
     /// 触发计划 + 解析后的驻留分区。后端按此降级（SIMD/GPU/CPU），无需 fork 核心。
     pub fn last_schedule(&self) -> &Schedule {
         &self.schedule
+    }
+
+    /// 注册一个 kernel IR 后端。新后端优先于 core 的默认 scalar SoA backend；
+    /// runtime 会按 [`ScheduleGroup::residency`] 选择第一个声明支持该驻留 hint 的后端。
+    pub fn register_kernel_backend(&mut self, backend: Box<dyn KernelBackend>) {
+        self.kernel_backends.insert(0, backend);
+    }
+
+    /// 当前 kernel backend 的选择顺序（调试 / 测试用）。
+    pub fn kernel_backend_names(&self) -> Vec<&'static str> {
+        self.kernel_backends.iter().map(|b| b.name()).collect()
     }
 
     /// 开启 render 摄入：此后每次 [`Runtime::step`] 留存本帧路由写集，供第二个
@@ -498,8 +550,17 @@ impl Runtime {
     }
 
     /// 定时语义（§6.2）：到点 runtime 写 `Clock.alarm = payload`，订阅者 each 触发。
+    /// 绝对帧排程：`at_frame` 处 `Clock.frame` tick 时写出 alarm。
     pub fn set_alarm(&mut self, at_frame: u64, payload: Value) {
         self.clock.set_alarm(at_frame, payload);
+    }
+
+    /// 相对当前帧排程：`frames` 帧后触发（at = `frame()` + frames）。alarm 在 tick(at)
+    /// 时写出，故 `frames == 0` 指向已 tick 的当前帧、不会触发；常用 `frames >= 1`。
+    /// 极大间隔在 `u64::MAX` 饱和，避免 release 回绕到过去帧。
+    pub fn set_alarm_in(&mut self, frames: u64, payload: Value) {
+        self.clock
+            .set_alarm(self.frame.saturating_add(frames), payload);
     }
 
     /// 注册 calculation 及其唯一前置 predicate（单谓词制，§1.4），默认档位。
@@ -569,6 +630,23 @@ impl Runtime {
                 ));
             }
             unique_writes.push(w);
+        }
+
+        if opts.tier == Tier::Kernel && opts.kernel_ir.is_none() {
+            return Err(format!(
+                "Kernel 档 calculation {name} 必须提供 kernel IR（C1/D4 机检入口）"
+            ));
+        }
+        if let Some(ir) = &opts.kernel_ir {
+            for f in ir.read_fields() {
+                check_field(&self.store, ty, f)?;
+            }
+            let input_shape = match &pred.delivery {
+                Delivery::Each(projs) => KernelInputShape::Each { arity: projs.len() },
+                Delivery::Batch(_) => KernelInputShape::Batch,
+                Delivery::Fold(_) => KernelInputShape::Fold,
+            };
+            ir.validate(name, declared_writes, opts.reads.as_deref(), input_shape)?;
         }
 
         // ECS 快路识别（白送优化）：type(Clock, frame) + 恒真条件 + each
@@ -645,6 +723,13 @@ impl Runtime {
         let next = self.cond_classes.len() as u32;
         let cond_class = *self.cond_classes.entry(key).or_insert(next);
         let compiled = route::CompiledCond::compile(&pred.cond);
+        // 投影编译（OQ2）：each/batch 的 projs 各编一份，fold 无投影。
+        let proj_compiled = match &pred.delivery {
+            Delivery::Each(projs) | Delivery::Batch(projs) => {
+                projs.iter().map(route::CompiledProj::compile).collect()
+            }
+            Delivery::Fold(_) => vec![],
+        };
         self.profile.trigger_counts.push(0);
         self.calcs.push(RegisteredCalc {
             name: name.to_string(),
@@ -653,6 +738,7 @@ impl Runtime {
             cond_indep,
             cond_class,
             compiled,
+            proj_compiled,
             declared_writes: declared_writes.iter().copied().collect(),
             opts,
             pred,
@@ -703,10 +789,10 @@ impl Runtime {
     fn revoke_dead_from_folds(&mut self, dead: InstanceId) {
         let keys: Vec<_> = self.fold_state.keys().copied().collect();
         for (c, sub) in keys {
-            if let Some(st) = self.fold_state.get_mut(&(c, sub)) {
-                if route::fold_revoke_member(st, dead) {
-                    self.fold_dirty.push((c, sub));
-                }
+            if let Some(st) = self.fold_state.get_mut(&(c, sub))
+                && route::fold_revoke_member(st, dead)
+            {
+                self.fold_dirty.push((c, sub));
             }
         }
     }
@@ -739,9 +825,12 @@ impl Runtime {
         // 成员死亡撤销（上一帧结算）标脏的 fold：本帧并入交付，重投递新聚合值。
         let dirty_folds = std::mem::take(&mut self.fold_dirty);
         // 阶段一：路由（索引查找 → 条件判定 → 交付物化）
+        let route_ref_reverse = routing_ref_reverse(&self.store, &self.idx.ref_reverse, &w);
+        let ref_reverse = route_ref_reverse.as_ref().unwrap_or(&self.idx.ref_reverse);
         let mut triggers = route::route(
             &self.store,
             &self.idx,
+            ref_reverse,
             &self.calcs,
             &mut self.fold_state,
             &mut self.scratch,
@@ -764,15 +853,22 @@ impl Runtime {
         //      新生实体身份仅在固定调度（Canonical）下与序无关，Free 下至多差一个 id 置换
         //      （spawn 按触发序分配 id，重排即重排 id 赋予）。
         // 跨 calc 写不同 cell（D1）⇒ 折叠互不影响；同 calc 同 cell 由稳定排序保相对序。
-        // 不变量不覆盖闭包的 ambient 副作用（log/RNG/static）——那在 store 之外，由
-        // effect-confinement 假设排除（execution 层为不透明 Box<dyn Fn>，本实现只能假设、
-        // 不能机检；补 kernel-IR seam 后可升级为保证）。
+        // 不变量不覆盖 General 闭包的 ambient 副作用（log/RNG/static）——那在 store
+        // 之外，由 effect-confinement 假设排除。Kernel IR 子集已按构造无 ctx 外副作用；
+        // 闭包 fallback 仍保留这部分受信面。
         triggers.sort_by_key(|t| t.calc.0);
         self.schedule = self.build_schedule(&triggers);
         // 阶段二：执行。零序约束（快照读 + D1 + 写局部 + effect-confinement）：帧内任何
         // 调度对提交 store 语义等价（精确命题见上）。写落本地缓冲、帧界提交——无原子、无伪共享。
-        let (exec_buf, spawns) =
-            run_triggers(&self.store, &self.calcs, self.detect, self.frame, &triggers);
+        let (exec_buf, spawns) = run_triggers(
+            &self.store,
+            &self.calcs,
+            &self.kernel_backends,
+            self.detect,
+            self.frame,
+            &triggers,
+            &self.schedule,
+        );
         self.spawn_queue.extend(spawns);
         for rec in &clock_writes {
             self.store.set(rec.inst, rec.field, rec.new.clone());
@@ -869,14 +965,14 @@ impl Runtime {
         };
         for &c in &self.ecs_calcs {
             let rc = &self.calcs[c.0 as usize];
-            let Delivery::Each(projs) = &rc.pred.delivery else {
+            let Delivery::Each(_) = &rc.pred.delivery else {
                 unreachable!()
             };
             self.store.for_each_alive(rc.ty, |sub| {
                 triggers.push(Trigger {
                     calc: c,
                     subscriber: sub,
-                    input: Input::Each(route::project(projs, &w, sub, &self.store)),
+                    input: Input::Each(route::project(&rc.proj_compiled, &w, sub, &self.store)),
                 });
             });
         }
@@ -931,28 +1027,17 @@ impl Default for Runtime {
     }
 }
 
-impl crate::calculation::SnapshotRead for Store {
-    fn read(&self, inst: InstanceId, field: FieldId) -> Value {
-        Store::read(self, inst, field)
-    }
-}
-
 // ---- 阶段二：执行 ----
 
 /// 单触发执行：返回 (写缓冲, spawn 请求)。线程本地缓冲——写从不落共享存储。
-fn run_one(
-    store: &Store,
-    calcs: &[RegisteredCalc],
-    detect: Detect,
-    t: &Trigger,
-) -> (
-    Vec<(FieldId, Value)>,
-    Vec<(EntityTypeId, Vec<(FieldId, Value)>)>,
-) {
+fn run_one(store: &Store, calcs: &[RegisteredCalc], detect: Detect, t: &Trigger) -> RunOneOutput {
     if !store.alive(t.subscriber) {
         return (vec![], vec![]);
     }
     let rc = &calcs[t.calc.0 as usize];
+    if let Some(ir) = &rc.opts.kernel_ir {
+        return (ir.run(store, t.subscriber, &t.input), vec![]);
+    }
     let mut ctx = Ctx {
         snapshot: store,
         self_id: t.subscriber,
@@ -978,23 +1063,55 @@ fn run_one(
 fn run_triggers(
     store: &Store,
     calcs: &[RegisteredCalc],
+    kernel_backends: &[Box<dyn KernelBackend>],
     detect: Detect,
     frame: u64,
     triggers: &[Trigger],
-) -> (Vec<WriteRec>, Vec<(EntityTypeId, Vec<(FieldId, Value)>)>) {
-    #[cfg(feature = "parallel")]
-    let results: Vec<_> = {
-        use rayon::prelude::*;
-        triggers
-            .par_iter()
-            .map(|t| run_one(store, calcs, detect, t))
-            .collect()
-    };
-    #[cfg(not(feature = "parallel"))]
-    let results: Vec<_> = triggers
-        .iter()
-        .map(|t| run_one(store, calcs, detect, t))
-        .collect();
+    schedule: &Schedule,
+) -> RunTriggersOutput {
+    let mut results = Vec::with_capacity(triggers.len());
+    let mut start = 0usize;
+    for group in &schedule.groups {
+        let end = start + group.count;
+        let group_triggers = &triggers[start..end];
+        debug_assert!(group_triggers.iter().all(|t| t.calc == group.calc));
+        let rc = &calcs[group.calc.0 as usize];
+        if let Some(ir) = &rc.opts.kernel_ir {
+            let backend = select_kernel_backend(kernel_backends, group.residency);
+            let lanes: Vec<_> = group_triggers.iter().map(|t| t.subscriber).collect();
+            let inputs: Vec<_> = group_triggers.iter().map(|t| &t.input).collect();
+            let output = backend.run(
+                ir,
+                KernelBatch::new(store, &lanes, &inputs, group.residency),
+            );
+            validate_kernel_output(ir, &output, lanes.len(), backend.name());
+            for (lane, inst) in lanes.iter().enumerate() {
+                let writes = if store.alive(*inst) {
+                    output.lane_writes(lane)
+                } else {
+                    vec![]
+                };
+                results.push((writes, vec![]));
+            }
+        } else {
+            #[cfg(feature = "parallel")]
+            let group_results: Vec<_> = {
+                use rayon::prelude::*;
+                group_triggers
+                    .par_iter()
+                    .map(|t| run_one(store, calcs, detect, t))
+                    .collect()
+            };
+            #[cfg(not(feature = "parallel"))]
+            let group_results: Vec<_> = group_triggers
+                .iter()
+                .map(|t| run_one(store, calcs, detect, t))
+                .collect();
+            results.extend(group_results);
+        }
+        start = end;
+    }
+    debug_assert_eq!(start, triggers.len());
 
     let mut folded: Vec<WriteRec> = vec![];
     let mut by_cell: HashMap<CellAddr, usize> = HashMap::new();
@@ -1022,7 +1139,7 @@ fn run_triggers(
             };
             match by_cell.get(&key) {
                 Some(&i) => {
-                    // C5 检测档位：debug 检测 / release 静默折叠（§8 开放问题四）
+                    // C5 检测档位：debug 检测 / release 静默折叠（§2 检测档位 Detect）
                     if folded[i].new != v && detect != Detect::Silent {
                         let msg = format!(
                             "[PCE] 帧 {frame}：{} 多次运行对同字段写入不同值，折叠顺序未定义（§2）",
@@ -1049,6 +1166,52 @@ fn run_triggers(
         }
     }
     (folded, spawns)
+}
+
+fn select_kernel_backend(
+    kernel_backends: &[Box<dyn KernelBackend>],
+    residency: Residency,
+) -> &dyn KernelBackend {
+    kernel_backends
+        .iter()
+        .find(|backend| backend.supports_residency(residency))
+        .map(|backend| &**backend)
+        .expect("Runtime must keep the scalar kernel backend fallback registered")
+}
+
+fn validate_kernel_output(
+    ir: &KernelIr,
+    output: &KernelBatchOutput,
+    lanes: usize,
+    backend_name: &str,
+) {
+    let expected: Vec<FieldId> = ir.writes().iter().map(|w| w.field).collect();
+    let mut seen = HashSet::new();
+    for w in output.writes() {
+        assert_eq!(
+            w.values.len(),
+            lanes,
+            "kernel backend {backend_name} returned a column with the wrong lane count"
+        );
+        assert!(
+            w.field != FIELD_ALIVE,
+            "kernel backend {backend_name} returned forbidden _alive output"
+        );
+        assert!(
+            expected.contains(&w.field),
+            "kernel backend {backend_name} returned a field not declared by KernelIr"
+        );
+        assert!(
+            seen.insert(w.field),
+            "kernel backend {backend_name} returned duplicate output field"
+        );
+    }
+    for field in expected {
+        assert!(
+            seen.contains(&field),
+            "kernel backend {backend_name} omitted a KernelIr output field"
+        );
+    }
 }
 
 fn check_field(store: &Store, ty: EntityTypeId, field: FieldId) -> Result<(), String> {
@@ -1161,7 +1324,7 @@ fn spawn_now(
 /// RowPolicy 留洞或压缩（C6）。
 fn settle_death(
     store: &mut Store,
-    ref_reverse: &mut HashMap<InstanceId, HashSet<(InstanceId, FieldId)>>,
+    ref_reverse: &mut RefReverse,
     dead: InstanceId,
     recs: &mut Vec<WriteRec>,
 ) {
@@ -1183,12 +1346,11 @@ fn settle_death(
     let nfields = store.fields(dead.ty).len();
     for fi in 0..nfields {
         let f = FieldId(fi as u32);
-        if store.is_ref_field(dead.ty, f) {
-            if let Value::Ref(target) = store.read(dead, f) {
-                if let Some(set) = ref_reverse.get_mut(&target) {
-                    set.remove(&(dead, f));
-                }
-            }
+        if store.is_ref_field(dead.ty, f)
+            && let Value::Ref(target) = store.read(dead, f)
+            && let Some(set) = ref_reverse.get_mut(&target)
+        {
+            set.remove(&(dead, f));
         }
     }
     store.release(dead);
@@ -1197,7 +1359,7 @@ fn settle_death(
 /// ref 反向表维护：每次 ref 类型 cell 提交时增删对应反向项。
 fn maintain_ref_reverse(
     store: &Store,
-    ref_reverse: &mut HashMap<InstanceId, HashSet<(InstanceId, FieldId)>>,
+    ref_reverse: &mut RefReverse,
     inst: InstanceId,
     field: FieldId,
     old: &Value,
@@ -1206,12 +1368,50 @@ fn maintain_ref_reverse(
     if !store.is_ref_field(inst.ty, field) {
         return;
     }
-    if let Value::Ref(t) = old {
-        if let Some(set) = ref_reverse.get_mut(t) {
-            set.remove(&(inst, field));
-        }
+    if let Value::Ref(t) = old
+        && let Some(set) = ref_reverse.get_mut(t)
+    {
+        set.remove(&(inst, field));
     }
     if let Value::Ref(t) = new {
         ref_reverse.entry(*t).or_default().insert((inst, field));
     }
+}
+
+fn routing_ref_reverse(
+    store: &Store,
+    current: &RefReverse,
+    writes: &[WriteRec],
+) -> Option<RefReverse> {
+    if !writes
+        .iter()
+        .any(|rec| store.is_ref_field(rec.inst.ty, rec.field))
+    {
+        return None;
+    }
+    let mut snapshot = current.clone();
+    for rec in writes.iter().rev() {
+        maintain_ref_reverse(
+            store,
+            &mut snapshot,
+            rec.inst,
+            rec.field,
+            &rec.new,
+            &rec.old,
+        );
+    }
+    // Spawn init writes are the first observable values of a newly born target.
+    // Keep end-of-frame holders for those targets so `inst(ref, field)` can see
+    // initial fields without letting ordinary ref rebinds route to their new
+    // target one frame early.
+    for rec in writes {
+        if rec.field == FIELD_ALIVE
+            && rec.old == Value::Bool(false)
+            && rec.new == Value::Bool(true)
+            && let Some(holders) = current.get(&rec.inst)
+        {
+            snapshot.insert(rec.inst, holders.clone());
+        }
+    }
+    Some(snapshot)
 }

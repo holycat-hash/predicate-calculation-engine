@@ -144,6 +144,69 @@ fn culling_uses_sampled_render_position_for_active_tracks() {
     );
 }
 
+#[test]
+fn culling_uses_renderable_track_when_multiple_tracks_share_sim_field() {
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type(
+        "Unit",
+        vec![FieldDef::new("pos", Value::vec3(0.0, 0.0, 0.0))],
+        false,
+    );
+    let cam_ty = rt.register_entity_type(
+        "Cam",
+        vec![FieldDef::new("pos", Value::vec3(0.0, 0.0, 0.0))],
+        false,
+    );
+    let f_upos = rt.field(unit, "pos");
+    let f_cpos = rt.field(cam_ty, "pos");
+    rt.enable_render_feed();
+
+    let mut rr = RenderRuntime::new(&rt);
+    let _snap_pos = rr.track(unit, f_upos, Interp::Snap).unwrap();
+    let lerp_pos = rr.track(unit, f_upos, Interp::Vec3Lerp).unwrap();
+    let cam_pos = rr.track(cam_ty, f_cpos, Interp::Vec3Lerp).unwrap();
+    rr.renderable(
+        unit,
+        RenderBinding {
+            translation: Some(lerp_pos),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cam = rt.spawn(cam_ty, vec![]);
+    rr.enable_culling(20.0, Axes::XY, cam, cam_pos, CullShape::Radius(50.0))
+        .unwrap();
+    rr.cull_type(unit, f_upos, None).unwrap();
+    let publisher = Publisher::new(rr.tracked_fields());
+
+    let u = rt.spawn(unit, vec![(f_upos, Value::vec3(10.0, 0.0, 0.0))]);
+    rt.step();
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 1.0);
+    assert_eq!(
+        rr.submit()
+            .packets
+            .iter()
+            .map(|p| p.inst)
+            .collect::<Vec<_>>(),
+        vec![u]
+    );
+
+    rt.debug_write(u, f_upos, Value::vec3(100.0, 0.0, 0.0));
+    rt.step();
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 0.0);
+    assert_eq!(
+        rr.submit()
+            .packets
+            .iter()
+            .map(|p| p.inst)
+            .collect::<Vec<_>>(),
+        vec![u],
+        "culling must follow the Vec3Lerp track bound as renderable translation"
+    );
+}
+
 /// LOD：距离写进 dist 字段，开发者经 lod_band 分档。
 #[test]
 fn distance_field_exposed_for_lod() {

@@ -191,9 +191,11 @@ fn setup() -> (Runtime, F) {
                         .map(map_of)
                         .map(|m| as_i64(m.get("hate").unwrap_or(&Value::Int(0))))
                         .unwrap_or(0);
-                    if best_taunted || current == Value::Null || *key == current_key {
-                        best_map.get("who").cloned().unwrap_or(Value::Null)
-                    } else if best_hate * 10 > current_hate * 11 {
+                    let switch_target = best_taunted
+                        || current == Value::Null
+                        || *key == current_key
+                        || best_hate * 10 > current_hate * 11;
+                    if switch_target {
                         best_map.get("who").cloned().unwrap_or(Value::Null)
                     } else {
                         current

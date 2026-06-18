@@ -34,7 +34,7 @@ use super::{Determinism, Indexes, RegisteredCalc, Store, Trigger, WriteRec};
 /// - 写更新时撤销该 writer 的上一笔（而非靠 `w.old`——首写 old=schema 默认值，
 ///   会伪命中坐在同值的他人）；
 /// - 成员死亡时（无写、§6.3）由 [`fold_revoke_member`] 按实例精确撤销其贡献，
-///   令 min/max 在成员退出后正确收缩（补 §8 开放问题三 / route.rs 旧 TODO）。
+///   令 min/max 在成员退出后正确收缩（§6.3 成员死亡撤销；补 route.rs 旧 TODO）。
 type FoldCell = (InstanceId, FieldId);
 
 #[derive(Debug, Clone)]
@@ -251,6 +251,10 @@ impl ThTable {
     }
 }
 
+type TypeBucketKey = (Vec<String>, VKey);
+type TypeBucketSubs = Vec<(CalcId, u32)>;
+type ScratchBatchRows = Vec<(BatchKey, Vec<Value>)>;
+
 /// (被盯类型, 字段) 的 type scope 订阅索引。
 /// 各容器是「无假阴性的前滤」：命中后仍求值完整条件（O(1)）。
 #[derive(Default)]
@@ -258,7 +262,7 @@ pub(crate) struct TypeIndex {
     /// 等值快路：条件含合取项 `new.path = self`——按 ref 直接点查订阅者。
     self_eq: Vec<(Vec<String>, CalcId, u32)>,
     /// 值桶：(投影路径, 常量) → 订阅。O(1) + k。
-    buckets: HashMap<(Vec<String>, VKey), Vec<(CalcId, u32)>>,
+    buckets: HashMap<TypeBucketKey, TypeBucketSubs>,
     /// 桶里出现过的去重路径（每写逐路径探一次桶）。
     bucket_paths: Vec<Vec<String>>,
     /// 共享排序阈值表：fires when new < t（或 ≤）。后缀范围查询 O(log s + k)。
@@ -313,19 +317,19 @@ impl TypeIndex {
                 Cond::Cmp(Expr::Val(ValRef::New(p)), op, Expr::Val(ValRef::Const(v)))
                     if p.is_empty() =>
                 {
-                    if let Some(t) = v.as_f64() {
-                        if self.add_threshold(*op, t, calc, group) {
-                            return;
-                        }
+                    if let Some(t) = v.as_f64()
+                        && self.add_threshold(*op, t, calc, group)
+                    {
+                        return;
                     }
                 }
                 Cond::Cmp(Expr::Val(ValRef::Const(v)), op, Expr::Val(ValRef::New(p)))
                     if p.is_empty() =>
                 {
-                    if let (Some(t), Some(m)) = (v.as_f64(), mirror(*op)) {
-                        if self.add_threshold(m, t, calc, group) {
-                            return;
-                        }
+                    if let (Some(t), Some(m)) = (v.as_f64(), mirror(*op))
+                        && self.add_threshold(m, t, calc, group)
+                    {
+                        return;
                     }
                 }
                 // crossed(常量, dir) → 区间查询
@@ -374,19 +378,19 @@ impl TypeIndex {
         mut hit: impl FnMut(CalcId, u32, Option<InstanceId>),
     ) {
         for (path, c, g) in &self.self_eq {
-            if let Some(target) = w.new.get_path(path).as_ref_id() {
-                if target.ty == calcs[c.0 as usize].ty {
-                    hit(*c, *g, Some(target));
-                }
+            if let Some(target) = w.new.get_path(path).as_ref_id()
+                && target.ty == calcs[c.0 as usize].ty
+            {
+                hit(*c, *g, Some(target));
             }
         }
         for path in &self.bucket_paths {
             let v = w.new.get_path(path);
-            if let Some(k) = probe_key(&v) {
-                if let Some(subs) = self.buckets.get(&(path.clone(), k)) {
-                    for &(c, g) in subs {
-                        hit(c, g, None);
-                    }
+            if let Some(k) = probe_key(&v)
+                && let Some(subs) = self.buckets.get(&(path.clone(), k))
+            {
+                for &(c, g) in subs {
+                    hit(c, g, None);
                 }
             }
         }
@@ -482,7 +486,7 @@ pub(crate) fn cond_sub_independent(c: &Cond) -> bool {
 #[derive(Default)]
 pub(crate) struct Scratch {
     /// batch 私有帧缓冲。行携带规范序键（C4 Canonical 时排序，Free 时忽略）。
-    batch_buf: HashMap<(CalcId, InstanceId), Vec<(BatchKey, Vec<Value>)>>,
+    batch_buf: HashMap<(CalcId, InstanceId), ScratchBatchRows>,
     batch_order: Vec<(CalcId, InstanceId)>,
     /// `&` 合取闩（§4）：每 (谓词, 订阅者) 每帧位码；最高位 = 本帧已触发。
     latch: HashMap<(CalcId, InstanceId), u32>,
@@ -517,6 +521,7 @@ struct EvalCtx<'a> {
 pub(crate) fn route(
     store: &Store,
     idx: &Indexes,
+    ref_reverse: &HashMap<InstanceId, HashSet<(InstanceId, FieldId)>>,
     calcs: &[RegisteredCalc],
     fold_state: &mut HashMap<(CalcId, InstanceId), FoldAcc>,
     scratch: &mut Scratch,
@@ -545,7 +550,7 @@ pub(crate) fn route(
             ti.probe(w, calcs, |c, g, sub| hits.push((c, g, sub)));
         }
         // inst：经 ref 反向表点查持有者，再查 (持有者类型, ref 字段, 被盯字段) 索引
-        if let Some(holders) = idx.ref_reverse.get(&w.inst) {
+        if let Some(holders) = ref_reverse.get(&w.inst) {
             for &(holder, rf) in holders {
                 if let Some(subs) = idx.inst.get(&(holder.ty, rf, w.field)) {
                     for &(c, g) in subs {
@@ -709,21 +714,21 @@ fn deliver(
         *bits |= fired;
     }
     match &rc.pred.delivery {
-        Delivery::Each(projs) => {
+        Delivery::Each(_) => {
             triggers.push(Trigger {
                 calc: c,
                 subscriber: sub,
-                input: Input::Each(project(projs, w, sub, store)),
+                input: Input::Each(project(&rc.proj_compiled, w, sub, store)),
             });
         }
-        Delivery::Batch(projs) => {
+        Delivery::Batch(_) => {
             let key = (c, sub);
             let buf = scratch.batch_buf.entry(key).or_insert_with(|| {
                 scratch.batch_order.push(key);
                 vec![]
             });
             let okey = (w.inst.ty.0, w.inst.id, w.inst.generation, w.field.0);
-            buf.push((okey, project(projs, w, sub, store)));
+            buf.push((okey, project(&rc.proj_compiled, w, sub, store)));
         }
         Delivery::Fold(op) => {
             if w.field != FIELD_ALIVE && !store.alive(w.inst) {
@@ -738,29 +743,111 @@ fn deliver(
     }
 }
 
+/// 投影项的注册期编译形（§3.4）：直接取值臂 + 算术臂（[`CompiledExpr`]，OQ2）。
+/// 编译一次；运行期取值臂零分配，算术臂的求值栈仅在真有 `Expr` 投影时才分配。
+#[derive(Debug, Clone)]
+pub(crate) enum CompiledProj {
+    New(Vec<String>),
+    Old(Vec<String>),
+    WriterId,
+    Own(FieldId),
+    Expr(CompiledExpr),
+}
+
+impl CompiledProj {
+    pub(crate) fn compile(p: &Proj) -> CompiledProj {
+        match p {
+            Proj::New(path) => CompiledProj::New(path.clone()),
+            Proj::Old(path) => CompiledProj::Old(path.clone()),
+            Proj::WriterId => CompiledProj::WriterId,
+            Proj::Own(f) => CompiledProj::Own(*f),
+            Proj::Expr(e) => CompiledProj::Expr(CompiledExpr::compile(e)),
+        }
+    }
+}
+
+/// 投影侧算术的预编译形（OQ2）：只含值产出 ops（New/Old/Own/Const/SelfRef/四则），
+/// 由条件 `Expr` 共用的 [`compile_expr`] 生成——**编译器单一真源**。求值是值产出
+/// 子集（无布尔 ops），与条件求值器各保一份紧凑内核而不重复布尔逻辑。
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledExpr {
+    ops: Vec<COp>,
+}
+
+impl CompiledExpr {
+    pub(crate) fn compile(e: &Expr) -> CompiledExpr {
+        let mut ops = vec![];
+        compile_expr(e, &mut ops);
+        CompiledExpr { ops }
+    }
+
+    /// 求值返回栈顶值。`sub = Some((store, 订阅者))` 支持 own/self（sim 投影）；
+    /// `None`（render 投影）时 Own/SelfRef 不可达——注册期已裁定其不出现。
+    fn eval(
+        &self,
+        new: &Value,
+        old: &Value,
+        sub: Option<(&Store, InstanceId)>,
+        stack: &mut Vec<Value>,
+    ) -> Value {
+        stack.clear();
+        for op in &self.ops {
+            match op {
+                COp::New(p) => stack.push(new.get_path(p)),
+                COp::Old(p) => stack.push(old.get_path(p)),
+                COp::Own(f) => {
+                    let (store, s) = sub.expect("own 出现在只读投影中（注册期应已裁定）");
+                    stack.push(store.read(s, *f));
+                }
+                COp::Const(v) => stack.push(v.clone()),
+                COp::SelfRef => {
+                    let (_, s) = sub.expect("self 出现在只读投影中（注册期应已裁定）");
+                    stack.push(Value::Ref(s));
+                }
+                COp::Add => bin_arith(stack, |x, y| x + y),
+                COp::Sub => bin_arith(stack, |x, y| x - y),
+                COp::Mul => bin_arith(stack, |x, y| x * y),
+                COp::Div => bin_arith(stack, |x, y| x / y),
+                _ => unreachable!("投影 Expr 只编译出值产出 ops"),
+            }
+        }
+        stack.pop().unwrap_or(Value::Null)
+    }
+}
+
 /// 投影（§3.4）：交付一律是值快照，不是引用——引用不跨实体，值经由谓词通道流动。
-pub(crate) fn project(projs: &[Proj], w: &WriteRec, sub: InstanceId, store: &Store) -> Vec<Value> {
+pub(crate) fn project(
+    projs: &[CompiledProj],
+    w: &WriteRec,
+    sub: InstanceId,
+    store: &Store,
+) -> Vec<Value> {
+    // 算术投影的求值栈：`Vec::new()` 不分配，仅 Expr 臂首次 push 时才分配、跨臂复用。
+    let mut stack: Vec<Value> = Vec::new();
     projs
         .iter()
         .map(|p| match p {
-            Proj::New(path) => w.new.get_path(path),
-            Proj::Old(path) => w.old.get_path(path),
-            Proj::WriterId => Value::Ref(w.inst),
-            Proj::Own(f) => store.read(sub, *f),
+            CompiledProj::New(path) => w.new.get_path(path),
+            CompiledProj::Old(path) => w.old.get_path(path),
+            CompiledProj::WriterId => Value::Ref(w.inst),
+            CompiledProj::Own(f) => store.read(sub, *f),
+            CompiledProj::Expr(e) => e.eval(&w.new, &w.old, Some((store, sub)), &mut stack),
         })
         .collect()
 }
 
-/// 只读投影（render 反应复用此入口）：projs 保证不含 `Own`（注册期裁定），
-/// 故无需订阅者行 / store。与 [`project`] 的 new/old/writer 臂逐字同义。
-pub(crate) fn project_ro(projs: &[Proj], w: &WriteRec) -> Vec<Value> {
+/// 只读投影（render 反应复用此入口）：projs 保证不含 `Own`/`self`（注册期裁定），
+/// 故无需订阅者行 / store。与 [`project`] 的 new/old/writer/expr 臂逐字同义。
+pub(crate) fn project_ro(projs: &[CompiledProj], w: &WriteRec) -> Vec<Value> {
+    let mut stack: Vec<Value> = Vec::new();
     projs
         .iter()
         .map(|p| match p {
-            Proj::New(path) => w.new.get_path(path),
-            Proj::Old(path) => w.old.get_path(path),
-            Proj::WriterId => Value::Ref(w.inst),
-            Proj::Own(_) => unreachable!("render 投影不含 own（注册期裁定）"),
+            CompiledProj::New(path) => w.new.get_path(path),
+            CompiledProj::Old(path) => w.old.get_path(path),
+            CompiledProj::WriterId => Value::Ref(w.inst),
+            CompiledProj::Own(_) => unreachable!("render 投影不含 own（注册期裁定）"),
+            CompiledProj::Expr(e) => e.eval(&w.new, &w.old, None, &mut stack),
         })
         .collect()
 }

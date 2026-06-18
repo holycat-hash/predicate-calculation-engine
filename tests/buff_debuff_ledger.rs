@@ -185,6 +185,7 @@ fn setup() -> (Runtime, F) {
     (rt, f)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply(
     target: InstanceId,
     kind: &str,

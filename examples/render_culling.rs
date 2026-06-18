@@ -17,8 +17,8 @@
 
 use pce::predicate::type_scope;
 use pce::{
-    lod_band, Axes, Cond, CullShape, Delivery, FieldDef, Interp, Predicate, Publisher,
-    RenderBinding, RenderRuntime, Runtime, Value,
+    Axes, Cond, CullShape, Delivery, FieldDef, Interp, Predicate, Publisher, RenderBinding,
+    RenderRuntime, Runtime, Value, lod_band,
 };
 
 /// LOD 分档阈值（升序）：dist <25 → 档 0（最精），<60 → 档 1，否则档 2（最粗）。
@@ -133,6 +133,8 @@ fn main() {
         }
     }
 
-    println!("\n相机扫过时可见集滑动（近进远出）、LOD 随距离变粗细；最远的 x=400 仅相机临近才进集。");
+    println!(
+        "\n相机扫过时可见集滑动（近进远出）、LOD 随距离变粗细；最远的 x=400 仅相机临近才进集。"
+    );
     println!("剔除收窄了 continuous 与 submit 的扫描 N，未启用时退化为全扫——行为与今日逐字相同。");
 }

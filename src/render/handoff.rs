@@ -49,12 +49,18 @@ pub struct SimFrame {
 /// `ingest`：生灭事件无丢失，插值自然落在最后一帧的区间。sim 远快于 render 时：所有
 /// 事件照常处理，只画最新插值态——正是「render 跟不上」时该有的行为（DF3）。
 ///
+/// **队列界（B5）。** 队列长度 = 未 drain 的 sim 帧数：render 每帧 drain ⇒ 常态有界；
+/// 但 render **真停摆**（线程阻塞 / 长时间不 drain）时队列按 sim 帧数线性增长。缓解留作
+/// seam——把跳过的帧**合并**（生灭 / 事件按序追加、tracked 增量 latest-wins 折叠）成更少
+/// 的 `SimFrame`，令停摆期内存与「跳过多少帧」无关、只与「多少实体在动」有关；v1 未做
+/// （常态每帧 drain 不触发）。
+///
 /// 用 `Mutex<Vec>` 守一次队列操作，临界区只是 Vec 的 push / swap——render 取走后整个
 /// 插值区间不再加锁。
 pub struct Publisher {
     /// render 关心的 tracked cell 集（注册期定型）：(类型, sim 字段)。
     tracked_fields: Vec<(EntityTypeId, FieldId)>,
-    /// 未被 render 消费的已发布帧（顺序）。drain 清空，故不会无界增长。
+    /// 未被 render 消费的已发布帧（顺序）。长度 = 未 drain 的 sim 帧数（见 [`Publisher`] 队列界 B5）。
     queue: Mutex<Vec<Arc<SimFrame>>>,
 }
 

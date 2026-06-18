@@ -50,7 +50,11 @@ fn setup() -> (Runtime, W) {
         session_ty,
         Predicate::new(
             type_scope(conn_ty, w.beat),
-            Cond::Cmp(new_path(&["session"]), CmpOp::Eq, Expr::Val(ValRef::SelfRef)),
+            Cond::Cmp(
+                new_path(&["session"]),
+                CmpOp::Eq,
+                Expr::Val(ValRef::SelfRef),
+            ),
             Delivery::Each(vec![Proj::New(vec!["frame".to_string()])]),
         ),
         &[lease_f],
@@ -71,7 +75,11 @@ fn setup() -> (Runtime, W) {
             type_scope(clock_ty, clock_frame),
             Cond::AndNot(
                 Box::new(Cond::Cmp(new_val(), CmpOp::Gt, own_field(lease_f))),
-                Box::new(Cond::Cmp(own_field(state_f), CmpOp::Eq, lit(Value::str("dead")))),
+                Box::new(Cond::Cmp(
+                    own_field(state_f),
+                    CmpOp::Eq,
+                    lit(Value::str("dead")),
+                )),
             ),
             Delivery::Each(vec![]),
         ),

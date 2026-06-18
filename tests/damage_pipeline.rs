@@ -110,19 +110,19 @@ fn setup() -> (Runtime, F) {
             );
 
             let reflected = reflect_basis / 10;
-            if reflected > 0 {
-                if let Some(target) = reflected_from {
-                    ctx.write(
-                        reflect_out,
-                        Value::map([
-                            ("target", target),
-                            ("raw", Value::Int(reflected)),
-                            ("true", Value::Bool(false)),
-                            ("reflected", Value::Bool(true)),
-                            ("salt", Value::str("reflect")),
-                        ]),
-                    );
-                }
+            if reflected > 0
+                && let Some(target) = reflected_from
+            {
+                ctx.write(
+                    reflect_out,
+                    Value::map([
+                        ("target", target),
+                        ("raw", Value::Int(reflected)),
+                        ("true", Value::Bool(false)),
+                        ("reflected", Value::Bool(true)),
+                        ("salt", Value::str("reflect")),
+                    ]),
+                );
             }
         }),
     )

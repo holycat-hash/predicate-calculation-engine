@@ -94,6 +94,7 @@ pub enum Cond {
 
 /// project 可投影的项（§3.4）。交付一律是值快照，不是引用。
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Proj {
     New(Vec<String>),
     Old(Vec<String>),
@@ -101,6 +102,10 @@ pub enum Proj {
     WriterId,
     /// 订阅者 own 行字段。
     Own(FieldId),
+    /// 投影侧标量四则（§3.4）：与条件侧同一封闭集（new/old/own/const，含 self），
+    /// 复用条件 Expr 的预编译器求值。不引用其他实例 ⇒ 非 join、不动成本模型；
+    /// 投影发生在命中之后，O(表达式大小)/交付行。
+    Expr(Expr),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +140,11 @@ pub struct Predicate {
 
 impl Predicate {
     pub fn new(scope: Scope, cond: Cond, delivery: Delivery) -> Self {
-        Predicate { scope, cond, delivery }
+        Predicate {
+            scope,
+            cond,
+            delivery,
+        }
     }
 }
 

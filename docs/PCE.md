@@ -24,7 +24,7 @@ The predicate layer is a closed algebra. A predicate is a declaration-shaped str
 
 **D4 Effect confinement**: a calculation closure's only observable effects occur through `ctx` (`write`, `spawn`, and `destroy_self`). The closure has no ambient side effects outside `ctx`, such as I/O, log feedback, global/static mutation, or RNG not seeded through cells.
 
-This is orthogonal to **write locality**. Write locality constrains where a calculation writes: only fields on its own instance, enforced by `Ctx::write` not accepting an instance parameter plus D1. Effect confinement constrains what else can be touched outside `ctx`: nothing. It is currently a contract, not a machine-checked guarantee, because the execution layer is an opaque `Box<dyn Fn>`; the runtime can assume it but cannot verify it until a kernel-IR seam exists.
+This is orthogonal to **write locality**. Write locality constrains where a calculation writes: only fields on its own instance, enforced by `Ctx::write` not accepting an instance parameter plus D1. Effect confinement constrains what else can be touched outside `ctx`: nothing. General calculations remain opaque `Box<dyn Fn>` closures and therefore keep D4 as a contract. The kernel subset is now data: `KernelIr` runs through SoA `KernelBackend` dispatch, and `Tier::Kernel` requires an IR body that the runtime validates at registration, so D4 is machine-checked for that subset.
 
 D4 is pinned because legal free reordering (D3 / cross-calculation regrouping) and execution-stage parallelism (`parallel` feature) depend on it. More precisely, D1 + write locality + snapshot reads + effect confinement imply that persistent cell values committed to the store are independent of trigger order. New entity identities are order-independent only under a fixed schedule (`Canonical`, C4); under `Free`, results may differ by an id renaming. D1-D3 provide order independence inside the store, while D4 excludes ambient effects outside the store. Without both, reordering and parallel execution are not valid.
 
@@ -85,7 +85,7 @@ Frame N+1:  Stage 1 (routing) runtime holds frame N write set W:
 
 **Write folding**: if one calculation run assigns the same field multiple times, those assignments fold into one write record. `new` is the final value and `old` is the value committed in the previous frame.
 
-**Multiple triggers, D3 consequence 1**: with `each` delivery, one calculation may run multiple times in one frame. Every run uses the same snapshot. If those runs write the same field, folding order is undefined and the final value is nondeterministic. Therefore in-frame aggregation must be expressed with `batch` or `fold`; `each` read-modify-write accumulation is forbidden.
+**Multiple triggers, D3 consequence 1**: with `each` delivery, one calculation may run multiple times in one frame. Every run uses the same snapshot. If those runs write the same field, folding order is undefined and the final value is nondeterministic. Therefore in-frame aggregation must be expressed with `batch` or `fold`; `each` read-modify-write accumulation is forbidden. The runtime can detect, at end of frame, one calculation writing different values to the same field across multiple runs; the severity is a build-time setting (`Detect`: `Warn` by default in debug, `Silent` folding in release, optional `Strict` panic), not runtime arbitration.
 
 **Unordered delivery, D3 consequence 2**: batch consumers must be order-independent and treat delivery as a multiset. Replay determinism only holds for order-independent consumers.
 
@@ -115,7 +115,7 @@ The `ref` used by `inst` must come from a ref-typed field on the subscriber inst
 
 **Current limitations of conjunction `&`.** Conjunction is a same-frame co-occurrence gate. The current implementation has these boundaries:
 
-1. **Only `each` delivery**: conjunction scopes currently support only `each`. Using `batch` or `fold` with conjunction is rejected at registration time because the meaning of aggregation under same-frame gating is still undefined (Section 8).
+1. **Only `each` delivery**: conjunction scopes support only `each`. Using `batch` or `fold` with conjunction is rejected at registration time because aggregation under same-frame gating is ill-defined; such compositions are expressed by materializing an intermediate entity (Section 6.1).
 2. **Scope shape**: only "conjunction of disjunctions," such as `(a|b) & c`, is supported. "Disjunction of conjunctions," such as `(a&b) | c`, is rejected. For deeper nesting, materialize the intermediate value as an entity (Section 6.1).
 3. **Gate, not join**: `&` only checks that every branch wrote during the same frame. It does not join values. When the latch completes, delivery projects only the final write that completed the latch; it cannot deliver all branch values together. Association is by subscriber identity, not by a join key. Keyed association is a join and is forbidden by Section 3.3. Each subscriber can trigger at most once per frame.
 4. **Branch limit**: the conjunction latch is a `u32` bit mask, with the top bit reserved as the "already triggered this frame" flag, so the implementation limit is 31 branches.
@@ -147,14 +147,14 @@ delivery := each  project(...)        # one calculation run per hit
           | fold(sum|count|min|max)   # runtime-maintained incremental aggregate
 ```
 
-`project` may project `new`, `old`, the writer instance id as a ref value, and fields from the subscriber's own row. Delivery is always a value snapshot, never a reference.
+`project` may project `new`, `old`, the writer instance id as a ref value, fields from the subscriber's own row, and scalar arithmetic over the same closed set as conditions (new/old/own/const, e.g. `new.raw * own.armor`), reusing the same precompiled `Expr` evaluator. Projection happens after the hit, costs `O(expression size)` per delivered row, and stays out of the routing budget; referencing no other instance, it is not a join. Delivery is always a value snapshot, never a reference.
 
 `fold` is the most important pushed-down form: "sum of all Enemy HP" is O(N) if scanned in calculation every frame, but `fold sum` turns it into per-write delta maintenance.
 
 **Current limitations of `batch` / `fold`.**
 
 - **batch**: delivery is unordered (D3). The runtime aggregates one batch per `(calculation, subscriber)` per frame and delivers it once. The `Canonical` tier (C4) sorts by `(writer type, id, generation, field)`. `batch` cannot currently be used with conjunction `&` (Section 3.2).
-- **fold**: operators are the typed monoid set `{sum, count, min, max}`. Custom monoids are not exposed yet (open question three in Section 8). `min` and `max` are not invertible, so they are maintained with a multiset at `O(log n)` per write. `count` counts distinct contributing cells; `sum` ignores non-numeric writes. Member death, which has no write, is revoked out of band by the runtime and re-delivered as a shrunk aggregate in the next frame (Section 6.3). `fold` also cannot currently be used with conjunction `&`.
+- **fold**: operators are the typed monoid set `{sum, count, min, max}`. Custom monoids are deliberately not exposed (opening them would require a reversibility-or-recomputation contract; `min` / `max` are the non-invertible precedent). `min` and `max` are not invertible, so they are maintained with a multiset at `O(log n)` per write. `count` counts distinct contributing cells; `sum` ignores non-numeric writes. Member death, which has no write, is revoked out of band by the runtime and re-delivered as a shrunk aggregate in the next frame (Section 6.3). `fold` also cannot currently be used with conjunction `&`.
 
 ### 3.5 Admission Rule for Predicate Vocabulary
 
@@ -217,7 +217,7 @@ These do not enter the predicate layer. The standard pattern is to build a singl
 
 Each frame, the runtime writes the frame number into built-in cell `Clock.frame`. Subscribing to it is equivalent to polling: the cost exists, but it is explicit, visible, and paid by the subscriber. This is the only legal path for "must run every frame" logic. Everything else remains change-driven.
 
-The intended timer semantic is a `Clock` alarm mechanism backed by a timer wheel, but its exact interface remains an open question.
+The timer semantic is the `Clock` alarm mechanism backed by a timer wheel (O(1) per frame): at the due frame the runtime writes `Clock.alarm = payload` and subscribers fire via `each`. The interface is `Runtime::set_alarm(at_frame, payload)` (absolute) and `set_alarm_in(frames, payload)` (relative to the current frame).
 
 ### 6.3 Lifecycle, refs, and id Reuse
 
@@ -271,7 +271,7 @@ each
 
 **Invariants**: the four layers are closed for business mechanisms. Derived consumer runtimes and materialized-index helpers reuse the four layers and are not fifth concepts (Sections 0 and 9). The only trigger source is previous-frame writes. Write locality plus single writer (D1). Writes are events (D2). Delivery is unordered (D3), so consumers must be order-independent. Effect confinement (D4): calculations have no side effects outside `ctx`, which is a precondition for reordering and parallel execution. Snapshot reads: current-frame writes are invisible to the current frame. Predicates are data fixed at registration time and compilable. The cost invariant is `O(|W|*log + |F|)`, independent of predicate and instance counts.
 
-**Open questions**: first, the shape of the `Clock` alarm interface and timer-wheel integration. Second, whether `project` may perform projection-side arithmetic; condition-side scalar arithmetic is already allowed (Section 3.3). Third, whether `fold` exposes custom monoids; if it does, reversibility or recomputation strategy must be specified, with `min` / `max` already serving as non-invertible precedents. Fourth, the detection cost and severity for "one calculation writes different values to the same field through multiple runs in one frame" (Section 2): silent folding, warning, or error. Fifth, the semantics of using conjunction `&` with `batch` / `fold`: under same-frame gating, what is aggregated and how many times? The current implementation rejects this at registration time (Section 3.2).
+**Open questions**: the five originally listed have converged. Three are implemented: the alarm interface (`set_alarm` / `set_alarm_in`, Section 6.2), projection-side arithmetic (now allowed, Section 3.4), and same-field multi-write detection (a build-time `Detect` setting, Section 2). Two are **deliberately kept closed / rejected**: custom `fold` monoids (opening them would require a reversibility-or-recomputation contract, with `min` / `max` as the non-invertible precedent) and conjunction `&` with `batch` / `fold` (aggregation under same-frame gating is ill-defined); both compositions are instead expressed by materializing an intermediate entity (Section 6.1). The additional kernel-IR seam is implemented separately: `KernelIr` / `KernelOp`, `Tier::Kernel` read/write validation, SoA `KernelColumn` batch execution, and pluggable `KernelBackend` selection with a default `ScalarKernelBackend`. The remaining forward work is optional hardware backend implementation: SIMD code generation, feature-gated GPU execution, and real GPU residency policy.
 
 ---
 
@@ -283,7 +283,7 @@ The four layers are the simulation core. **`render` is a second runtime built ab
 
 **Two trigger sources, dual to sim's "only trigger source."**
 
-- render clock tick -> **continuous update**: on every render frame, run over each present instance for camera damping, derived transforms, interpolation, and similar work. This is a dense ECS scan and the main hot path of render, because interpolation is inherently per-frame.
+- render clock tick -> **continuous update**: on every render frame, run over each present instance for camera damping, derived transforms, interpolation, and similar work. This is a dense ECS scan and the main hot path of render, because interpolation is inherently per-frame. The continuous scan follows the same snapshot-read as sim (this frame's continuous writes are committed together at frame end and are invisible during the scan), so cross-instance reads are deterministic and the scan parallelizes per instance under the `parallel` feature (render fields are single-writer, no contention).
 - ingested sim write log -> **event reaction**: reuse the predicate algebra, including the same precompiled condition evaluator, while subscribing to the sim write stream.
 
 After sim enables ingestion with `Runtime::enable_render_feed()`, each frame retains the routed write set: the same write stream that Section 0 calls the only trigger source, including birth writes from external spawn. Render consumes it through `Runtime::committed_writes()`.
@@ -291,6 +291,8 @@ After sim enables ingestion with `Runtime::enable_render_feed()`, each frame ret
 **One-way dependency rule.** Render writes only render namespace fields (`RFieldId`) and reads sim fields through tracked mirrors. **Sim never reads render.** This structurally enforces concurrency decoupling and is an expression of field-level D1: render extension writers exclusively claim render fields through `claim_writes` (Section 0.1).
 
 **Shared lifecycle is owned by sim.** Render has no entry point for spawning or destroying shared entities; its sidecar rows passively follow sim birth and death deltas. If death fade-out is configured, render only delays reclaiming its own sidecar row by advancing a fade weight from 1 to 0 using real `dt`; it does not change the sim fact of life or death.
+
+**Render-local temporary entities are the deliberate exception, and the reason that rule says _shared_.** Particles, floating combat text, and decals are visual-only residents that should never enter the sim schema, write log, or predicates. They are render-private pooled entities with a render-owned lifecycle. They live in a separate id namespace (`RenderLocalTypeId` / `RenderLocalId`, never a sim `InstanceId`) backed by the same typed `Column` + `GenSlots` kernels as sim rows; freed ids are pooled and reissued with a bumped generation so a stale handle can never address a new resident (the same ABA protection sim rows get). Render owns their birth and death directly: `spawn_local` from a host call, a shared render reaction, or a `local_continuous` tick; `destroy_self()` (or expiry logic) ends them — spawn/destroy commands are committed after the calc batch, so reads stay snapshot-consistent within a frame. Crucially this does not weaken the one-way rule or D1: a local channel still registers the same way (`local_continuous` for per-frame motion/decay under field-level single-writer ownership, `local_renderable` for the submission binding) and submits through a separate `submit_local()` / `LocalSubmissionView`, so a backend can route particles as their own pass without faking an `InstanceId`. It is not a fourth concept — it is the existing render machinery pointed at a render-owned pool instead of the sim sidecar.
 
 **Interpolation is the render dual of fold.** `track(sim_field, Interp)` is maintained automatically by the render runtime each frame as `(prev, cur)` and evaluated by alpha. Like `fold`, it is declarative pushdown, not hand-written calculation logic.
 

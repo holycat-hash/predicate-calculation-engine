@@ -240,6 +240,92 @@ fn reaction_skips_writer_that_dies_in_same_sim_frame() {
 }
 
 #[test]
+fn reaction_only_fires_on_its_own_cell_not_other_fields() {
+    // B1 回归：反应按 (类型, 字段) 分桶路由——一个字段的写不得串桶触发盯另一字段的反应。
+    // 两反应用同一条件（Became(5)）、只差所盯 sim 字段：若分桶错误让 mp 反应看到 hp 事件，
+    // 它会因 new==5 误触发，下面断言即可逮住。
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type(
+        "Unit",
+        vec![
+            FieldDef::new("hp", Value::Int(0)),
+            FieldDef::new("mp", Value::Int(0)),
+        ],
+        false,
+    );
+    let f_hp = rt.field(unit, "hp");
+    let f_mp = rt.field(unit, "mp");
+    rt.enable_render_feed();
+
+    let mut rr = RenderRuntime::new(&rt);
+    let r_hp_fx = rr.add_render_field(unit, Value::Int(0));
+    let r_mp_fx = rr.add_render_field(unit, Value::Int(0));
+    rr.reaction(
+        "hp_fx",
+        unit,
+        f_hp,
+        Cond::Became(Value::Int(5)),
+        vec![],
+        false,
+        &[r_hp_fx],
+        Box::new(move |ctx, _| ctx.write(r_hp_fx, 1)),
+    )
+    .unwrap();
+    rr.reaction(
+        "mp_fx",
+        unit,
+        f_mp,
+        Cond::Became(Value::Int(5)),
+        vec![],
+        false,
+        &[r_mp_fx],
+        Box::new(move |ctx, _| ctx.write(r_mp_fx, 1)),
+    )
+    .unwrap();
+    let publisher = Publisher::new(rr.tracked_fields());
+
+    let u = rt.spawn(unit, vec![(f_hp, Value::Int(0)), (f_mp, Value::Int(0))]);
+    rt.step();
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 1.0);
+    // 出生写 new=0 → Became(5) 假，两反应皆不触发。
+    assert_eq!(rr.read(u, r_hp_fx), Value::Int(0));
+    assert_eq!(rr.read(u, r_mp_fx), Value::Int(0));
+
+    // 只改 hp 到 5：hp 反应触发；mp 反应（不同 cell）绝不能被 hp 事件串桶。
+    rt.debug_write(u, f_hp, Value::Int(5));
+    rt.step();
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 1.0);
+    assert_eq!(
+        rr.read(u, r_hp_fx),
+        Value::Int(1),
+        "hp 反应在 hp 事件上触发"
+    );
+    assert_eq!(
+        rr.read(u, r_mp_fx),
+        Value::Int(0),
+        "mp 反应不被 hp 事件串桶触发"
+    );
+
+    // 只改 mp 到 5：轮到 mp 反应触发，hp 反应保持不变。
+    rt.debug_write(u, f_mp, Value::Int(5));
+    rt.step();
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 1.0);
+    assert_eq!(
+        rr.read(u, r_hp_fx),
+        Value::Int(1),
+        "hp 反应不被 mp 事件串桶触发"
+    );
+    assert_eq!(
+        rr.read(u, r_mp_fx),
+        Value::Int(1),
+        "mp 反应在 mp 事件上触发"
+    );
+}
+
+#[test]
 fn continuous_calc_accumulates_with_dt() {
     // 连续更新：每 render 帧 timer += dt（动态帧率：按时间积分，不按帧数）。
     let mut rt = Runtime::new();
@@ -512,4 +598,164 @@ fn render_detect_silent_folds_last_wins() {
     publisher.publish(&rt);
     rr.sync(&publisher, 0.016, 0.5);
     assert_eq!(rr.read(u, rf), Value::Int(2), "Silent 折叠为 last-wins=2");
+}
+
+#[test]
+fn render_reaction_projection_arithmetic_delivers_computed() {
+    // OQ2 render 侧：反应投影支持四则（只读子集 new/old/const，无 own/self），复用 sim CompiledProj。
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![FieldDef::new("hp", Value::Int(0))], false);
+    let f_hp = rt.field(unit, "hp");
+    rt.enable_render_feed();
+
+    let mut rr = RenderRuntime::new(&rt);
+    let r_out = rr.add_render_field(unit, Value::Float(0.0));
+    rr.reaction(
+        "scale_hp",
+        unit,
+        f_hp,
+        Cond::Changed,
+        vec![Proj::Expr(pce::Expr::Mul(
+            Box::new(pce::Expr::Val(pce::ValRef::New(vec![]))),
+            Box::new(pce::Expr::Val(pce::ValRef::Const(Value::Float(0.5)))),
+        ))],
+        false,
+        &[r_out],
+        Box::new(move |ctx, input| ctx.write(r_out, input.arg(0).clone())),
+    )
+    .unwrap();
+    let publisher = Publisher::new(rr.tracked_fields());
+
+    let u = rt.spawn(unit, vec![(f_hp, Value::Int(0))]);
+    rt.step();
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 1.0);
+
+    rt.debug_write(u, f_hp, Value::Int(40));
+    rt.step();
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 1.0);
+    assert_eq!(
+        rr.read(u, r_out),
+        Value::Float(20.0),
+        "投影 new*0.5 = 40*0.5"
+    );
+}
+
+#[test]
+fn render_reaction_rejects_projection_referencing_own() {
+    // render 反应投影算术只许 new/old/const；引用 own（订阅者行）注册期即拒绝。
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![FieldDef::new("hp", Value::Int(0))], false);
+    let f_hp = rt.field(unit, "hp");
+    rt.enable_render_feed();
+    let mut rr = RenderRuntime::new(&rt);
+    let r_out = rr.add_render_field(unit, Value::Float(0.0));
+    let bad = rr.reaction(
+        "bad",
+        unit,
+        f_hp,
+        Cond::Changed,
+        vec![Proj::Expr(pce::Expr::Val(pce::ValRef::Own(f_hp)))],
+        false,
+        &[r_out],
+        Box::new(|_ctx, _| {}),
+    );
+    assert!(bad.is_err(), "render 投影算术引用 own 必须注册期报错");
+}
+
+#[test]
+fn continuous_exponential_damping_is_framerate_independent() {
+    // B4 范式：缓动 / 相机阻尼须用 1−exp(−k·dt)，不是定值 lerp 因子，否则行为随帧率漂。
+    // 判据：同一总时长下，粗分（少帧大 dt）与细分（多帧小 dt）收敛到近似同一值。
+    // （残差每帧 ×= exp(−k·dt) ⇒ N 帧累积 exp(−k·Σdt)，与子分无关——故两者应几乎相等。）
+    fn ease_to(total: f64, steps: u32) -> f64 {
+        let mut rt = Runtime::new();
+        let unit = rt.register_entity_type("Unit", vec![FieldDef::new("x", Value::Int(0))], false);
+        rt.enable_render_feed();
+        let mut rr = RenderRuntime::new(&rt);
+        let r_x = rr.add_render_field(unit, Value::Float(0.0));
+        rr.continuous(
+            "ease",
+            unit,
+            &[r_x],
+            Box::new(move |ctx| {
+                let x = ctx.read(r_x).as_f64().unwrap_or(0.0);
+                let (target, k) = (100.0_f64, 3.0_f64);
+                let nx = x + (target - x) * (1.0 - (-k * ctx.dt()).exp());
+                ctx.write(r_x, nx);
+            }),
+        )
+        .unwrap();
+        let publisher = Publisher::new(rr.tracked_fields());
+        let u = rt.spawn(unit, vec![]);
+        rt.step();
+        publisher.publish(&rt);
+        pump(&mut rr, &publisher);
+        let dt = total / steps as f64;
+        for _ in 0..steps {
+            rr.render_frame(dt, 1.0);
+        }
+        rr.read(u, r_x).as_f64().unwrap()
+    }
+
+    let coarse = ease_to(1.0, 5); // 5 帧 × 0.20
+    let fine = ease_to(1.0, 200); // 200 帧 × 0.005
+    assert!(
+        (coarse - fine).abs() < 0.5,
+        "帧率正确阻尼应收敛同值：coarse={coarse} fine={fine}"
+    );
+    assert!(
+        fine > 90.0 && fine < 100.0,
+        "1s 后约趋近 target=100（1−exp(−3)≈0.95），未越过：fine={fine}"
+    );
+}
+
+#[test]
+fn continuous_snapshot_read_sees_frozen_not_same_frame_writes() {
+    // B3 快照读：continuous 扫描读 run_continuous 起点的冻结值——本帧另一 continuous 的写
+    // 在帧末才提交、扫描期不可见。故 copy（读 r_tick）落后 tick（写 r_tick）一帧，与 sim
+    // 快照读一致；这也是并行安全（结果与扫描序 / 线程数无关）的判据。
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![FieldDef::new("x", Value::Int(0))], false);
+    rt.enable_render_feed();
+    let mut rr = RenderRuntime::new(&rt);
+    let r_tick = rr.add_render_field(unit, Value::Int(0));
+    let r_seen = rr.add_render_field(unit, Value::Int(0));
+    // 先注册 tick（写 r_tick），后注册 copy（读 r_tick → 写 r_seen）：即便注册序让 copy
+    // 在 tick 之后跑，快照读也使 copy 看不到 tick 的本帧写。
+    rr.continuous(
+        "tick",
+        unit,
+        &[r_tick],
+        Box::new(move |ctx| {
+            let t = ctx.read(r_tick).as_i64().unwrap_or(0);
+            ctx.write(r_tick, t + 1);
+        }),
+    )
+    .unwrap();
+    rr.continuous(
+        "copy",
+        unit,
+        &[r_seen],
+        Box::new(move |ctx| {
+            ctx.write(r_seen, ctx.read(r_tick));
+        }),
+    )
+    .unwrap();
+    let publisher = Publisher::new(rr.tracked_fields());
+    let u = rt.spawn(unit, vec![]);
+    rt.step();
+    publisher.publish(&rt);
+    pump(&mut rr, &publisher);
+
+    for _ in 0..3 {
+        rr.render_frame(0.016, 1.0);
+    }
+    assert_eq!(rr.read(u, r_tick), Value::Int(3), "tick 每帧 +1");
+    assert_eq!(
+        rr.read(u, r_seen),
+        Value::Int(2),
+        "copy 读冻结 r_tick：落后一帧（快照读，而非同帧 live）"
+    );
 }

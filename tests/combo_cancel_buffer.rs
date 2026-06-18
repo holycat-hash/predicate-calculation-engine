@@ -83,7 +83,11 @@ fn setup() -> (Runtime, EntityTypeId, F) {
     rt.register_calculation(
         "intent_register",
         fighter,
-        Predicate::new(own(f.input_req), Cond::True, Delivery::Batch(vec![Proj::New(vec![])])),
+        Predicate::new(
+            own(f.input_req),
+            Cond::True,
+            Delivery::Batch(vec![Proj::New(vec![])]),
+        ),
         &[intent_f],
         Box::new(move |ctx, input| {
             let Input::Batch(rows) = input else { return };

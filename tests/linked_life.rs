@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use pce::predicate::{new_path, own, type_scope};
 use pce::{
     CmpOp, Cond, Delivery, EntityTypeId, Expr, FieldDef, FieldId, Input, InstanceId, Predicate,
-    Proj, Runtime, Scope, Value, ValRef,
+    Proj, Runtime, Scope, ValRef, Value,
 };
 
 fn target_is_self() -> Cond {
@@ -178,7 +178,11 @@ fn setup() -> (Runtime, W) {
     rt.register_calculation(
         "reclaim_probe",
         unit_ty,
-        Predicate::new(own(w.guard), Cond::Became(Value::Null), Delivery::Each(vec![])),
+        Predicate::new(
+            own(w.guard),
+            Cond::Became(Value::Null),
+            Delivery::Each(vec![]),
+        ),
         &[reclaim_op],
         Box::new(move |ctx, _| {
             ctx.write(

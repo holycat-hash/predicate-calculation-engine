@@ -2,11 +2,17 @@
 //! 共享阈值表、值桶、ECS 快路、fold min 多重集、RowPolicy（C6）、
 //! Canonical 确定性（C4）、Strict 检测（C5/C2/C1）、免费 profiler。
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use pce::predicate::{lit, new_val, own, own_field, type_scope};
 use pce::{
     CalcId, CalcOptions, CmpOp, Cond, Ctx, Delivery, Detect, Determinism, Dir, EntityTypeId, Expr,
-    FieldDef, FieldId, FoldOp, Input, Predicate, Proj, RowPolicy, Runtime, Scope, Tier, ValRef,
-    Value,
+    FieldDef, FieldId, FoldOp, Input, KernelBackend, KernelBatch, KernelBatchOutput, KernelColumn,
+    KernelColumnWrite, KernelIr, KernelOp, KernelWrite, Predicate, Proj, Residency, RowPolicy,
+    Runtime, ScalarKernelBackend, Scope, Tier, ValRef, Value,
 };
 
 fn field(name: &str, default: impl Into<Value>) -> FieldDef {
@@ -366,7 +372,7 @@ fn canonical_batch_delivers_sorted() {
 }
 
 /// C5 Strict：同字段被同一 calculation 多次运行写入不同值 → panic
-/// （release 默认 Silent 静默折叠，§8 开放问题四的档位化答案）。
+/// （release 默认 Silent 静默折叠，§2 检测档位 Detect；原 §8 开放问题四，已解决）。
 #[test]
 #[should_panic(expected = "多次运行对同字段写入不同值")]
 fn strict_detect_panics_on_conflicting_writes() {
@@ -431,16 +437,15 @@ fn strict_detect_panics_on_undeclared_read() {
     rt.step();
 }
 
-/// C1 Kernel 档 + Strict：kernel 子集禁动态分配（spawn）。
+/// C1 Kernel 档：必须提供 kernel IR，才能把 D4 从契约升级为机检。
 #[test]
-#[should_panic(expected = "Kernel 档")]
-fn kernel_tier_forbids_spawn() {
+fn kernel_tier_requires_kernel_ir() {
     let mut rt = Runtime::new();
     rt.set_detect(Detect::Strict);
     let unit = entity(&mut rt, "Unit", vec![field("v", 0)]);
     let f_v = rt.field(unit, "v");
 
-    register_opt(
+    let err = register_opt(
         &mut rt,
         "bad_kernel",
         unit,
@@ -450,14 +455,295 @@ fn kernel_tier_forbids_spawn() {
             tier: Tier::Kernel,
             ..CalcOptions::default()
         },
-        move |ctx, _| ctx.spawn(ctx.self_id().ty, vec![]),
+        move |ctx, _| ctx.write(f_v, 1),
+    )
+    .unwrap_err();
+    assert!(err.contains("kernel IR"), "{err}");
+}
+
+/// Kernel IR 默认 backend：与等价闭包语义一致；有 IR 时不调用闭包 fallback。
+#[test]
+fn kernel_ir_interpreter_matches_closure_path() {
+    let mut rt = Runtime::new();
+    let unit = entity(
+        &mut rt,
+        "Unit",
+        vec![
+            field("src", 0),
+            field("factor", 3),
+            field("closure_out", 0.0),
+            field("closure_big", false),
+            field("ir_out", 0.0),
+            field("ir_big", false),
+        ],
+    );
+    let src = rt.field(unit, "src");
+    let factor = rt.field(unit, "factor");
+    let closure_out = rt.field(unit, "closure_out");
+    let closure_big = rt.field(unit, "closure_big");
+    let ir_out = rt.field(unit, "ir_out");
+    let ir_big = rt.field(unit, "ir_big");
+
+    register(
+        &mut rt,
+        "closure_scale",
+        unit,
+        Predicate::new(own(src), Cond::True, Delivery::Each(vec![new_proj()])),
+        &[closure_out, closure_big],
+        move |ctx, input| {
+            let scaled = input.arg(0).as_f64().unwrap() * ctx.read_own(factor).as_f64().unwrap();
+            ctx.write(closure_out, scaled);
+            ctx.write(closure_big, scaled > 10.0);
+        },
+    )
+    .unwrap();
+
+    register_opt(
+        &mut rt,
+        "ir_scale",
+        unit,
+        Predicate::new(own(src), Cond::True, Delivery::Each(vec![new_proj()])),
+        &[ir_out, ir_big],
+        CalcOptions {
+            reads: Some(vec![factor]),
+            kernel_ir: Some(KernelIr::new(vec![
+                KernelWrite::new(
+                    ir_out,
+                    vec![
+                        KernelOp::InputArg(0),
+                        KernelOp::ReadOwn(factor),
+                        KernelOp::Mul,
+                    ],
+                ),
+                KernelWrite::new(
+                    ir_big,
+                    vec![
+                        KernelOp::InputArg(0),
+                        KernelOp::ReadOwn(factor),
+                        KernelOp::Mul,
+                        KernelOp::Const(Value::Float(10.0)),
+                        KernelOp::Cmp(CmpOp::Gt),
+                    ],
+                ),
+            ])),
+            ..CalcOptions::default()
+        },
+        move |_, _| panic!("kernel IR path must not call closure fallback"),
+    )
+    .unwrap();
+
+    let u = rt.spawn(unit, vec![(factor, Value::Int(3))]);
+    rt.step();
+    rt.debug_write(u, src, Value::Int(5));
+    rt.step();
+
+    assert_eq!(rt.read(u, closure_out), Value::Float(15.0));
+    assert_eq!(rt.read(u, ir_out), rt.read(u, closure_out));
+    assert_eq!(rt.read(u, closure_big), Value::Bool(true));
+    assert_eq!(rt.read(u, ir_big), rt.read(u, closure_big));
+}
+
+struct CountingGpuBackend {
+    calls: Arc<AtomicUsize>,
+    lanes: Arc<AtomicUsize>,
+}
+
+struct KillBackend;
+
+impl KernelBackend for KillBackend {
+    fn name(&self) -> &'static str {
+        "kill-backend"
+    }
+
+    fn run(&self, _ir: &KernelIr, batch: KernelBatch<'_>) -> KernelBatchOutput {
+        KernelBatchOutput::new(vec![KernelColumnWrite::new(
+            pce::entity::FIELD_ALIVE,
+            KernelColumn::Bool(vec![false; batch.lane_count()]),
+        )])
+    }
+}
+
+impl KernelBackend for CountingGpuBackend {
+    fn name(&self) -> &'static str {
+        "counting-gpu"
+    }
+
+    fn supports_residency(&self, residency: Residency) -> bool {
+        residency == Residency::Gpu
+    }
+
+    fn run(&self, ir: &KernelIr, batch: KernelBatch<'_>) -> KernelBatchOutput {
+        assert_eq!(batch.residency(), Residency::Gpu);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.lanes.fetch_add(batch.lane_count(), Ordering::SeqCst);
+        let backend = ScalarKernelBackend;
+        backend.run(ir, batch)
+    }
+}
+
+/// Kernel IR 第 3+4 步：同一 calc 的触发按 SoA batch 交给可插拔 backend，
+/// C3 residency pin 参与 backend 选择；默认 scalar backend 可作为精确 fallback。
+#[test]
+fn kernel_backend_receives_grouped_soa_batch() {
+    let mut rt = Runtime::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let lanes = Arc::new(AtomicUsize::new(0));
+    rt.register_kernel_backend(Box::new(CountingGpuBackend {
+        calls: calls.clone(),
+        lanes: lanes.clone(),
+    }));
+    assert_eq!(rt.kernel_backend_names()[0], "counting-gpu");
+    assert!(rt.kernel_backend_names().contains(&"scalar-soa"));
+
+    let unit = entity(
+        &mut rt,
+        "Unit",
+        vec![field("src", 0), field("factor", 1), field("out", 0.0)],
+    );
+    let src = rt.field(unit, "src");
+    let factor = rt.field(unit, "factor");
+    let out = rt.field(unit, "out");
+
+    register_opt(
+        &mut rt,
+        "gpu_scale",
+        unit,
+        Predicate::new(own(src), Cond::True, Delivery::Each(vec![new_proj()])),
+        &[out],
+        CalcOptions {
+            reads: Some(vec![factor]),
+            tier: Tier::Kernel,
+            residency: Residency::Gpu,
+            kernel_ir: Some(KernelIr::new(vec![KernelWrite::new(
+                out,
+                vec![
+                    KernelOp::InputArg(0),
+                    KernelOp::ReadOwn(factor),
+                    KernelOp::Mul,
+                ],
+            )])),
+        },
+        move |_, _| panic!("kernel backend path must not call closure fallback"),
+    )
+    .unwrap();
+
+    let a = rt.spawn(unit, vec![(factor, Value::Int(2))]);
+    let b = rt.spawn(unit, vec![(factor, Value::Int(3))]);
+    let c = rt.spawn(unit, vec![(factor, Value::Int(4))]);
+    rt.step();
+
+    rt.debug_write(a, src, Value::Int(5));
+    rt.debug_write(b, src, Value::Int(6));
+    rt.debug_write(c, src, Value::Int(7));
+    rt.step();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one backend call per calc group"
+    );
+    assert_eq!(
+        lanes.load(Ordering::SeqCst),
+        3,
+        "three triggers become three lanes"
+    );
+    assert_eq!(rt.read(a, out), Value::Float(10.0));
+    assert_eq!(rt.read(b, out), Value::Float(18.0));
+    assert_eq!(rt.read(c, out), Value::Float(28.0));
+}
+
+#[test]
+#[should_panic(expected = "forbidden _alive")]
+fn kernel_backend_cannot_smuggle_lifecycle_writes() {
+    let mut rt = Runtime::new();
+    rt.register_kernel_backend(Box::new(KillBackend));
+    let unit = entity(&mut rt, "Unit", vec![field("src", 0), field("out", 0)]);
+    let src = rt.field(unit, "src");
+    let out = rt.field(unit, "out");
+    register_opt(
+        &mut rt,
+        "legal_kernel",
+        unit,
+        Predicate::new(own(src), Cond::True, Delivery::Each(vec![])),
+        &[out],
+        CalcOptions::default()
+            .tier(Tier::Kernel)
+            .kernel_ir(KernelIr::new(vec![KernelWrite::new(
+                out,
+                vec![KernelOp::Const(Value::Int(1))],
+            )])),
+        move |_, _| panic!("kernel backend path must not call closure fallback"),
     )
     .unwrap();
 
     let u = rt.spawn(unit, vec![]);
     rt.step();
-    rt.debug_write(u, f_v, Value::Int(1));
+    rt.debug_write(u, src, Value::Int(1));
     rt.step();
+}
+
+/// Kernel IR 注册期校验：写集与读集都能被机检。
+#[test]
+fn kernel_ir_validates_declared_writes_and_reads() {
+    let mut rt = Runtime::new();
+    let unit = entity(&mut rt, "Unit", vec![field("src", 0), field("out", 0)]);
+    let src = rt.field(unit, "src");
+    let out = rt.field(unit, "out");
+
+    let err = register_opt(
+        &mut rt,
+        "bad_write_ir",
+        unit,
+        Predicate::new(own(src), Cond::True, Delivery::Each(vec![])),
+        &[],
+        CalcOptions {
+            kernel_ir: Some(KernelIr::new(vec![KernelWrite::new(
+                out,
+                vec![KernelOp::Const(Value::Int(1))],
+            )])),
+            ..CalcOptions::default()
+        },
+        move |_, _| {},
+    )
+    .unwrap_err();
+    assert!(err.contains("未声明字段"), "{err}");
+
+    let err = register_opt(
+        &mut rt,
+        "bad_read_ir",
+        unit,
+        Predicate::new(own(src), Cond::True, Delivery::Each(vec![])),
+        &[out],
+        CalcOptions {
+            reads: Some(vec![src]),
+            kernel_ir: Some(KernelIr::new(vec![KernelWrite::new(
+                out,
+                vec![KernelOp::ReadOwn(out)],
+            )])),
+            ..CalcOptions::default()
+        },
+        move |_, _| {},
+    )
+    .unwrap_err();
+    assert!(err.contains("读了未声明字段"), "{err}");
+
+    let err = register_opt(
+        &mut rt,
+        "bad_arg_ir",
+        unit,
+        Predicate::new(own(src), Cond::True, Delivery::Each(vec![])),
+        &[out],
+        CalcOptions {
+            kernel_ir: Some(KernelIr::new(vec![KernelWrite::new(
+                out,
+                vec![KernelOp::InputArg(0)],
+            )])),
+            ..CalcOptions::default()
+        },
+        move |_, _| {},
+    )
+    .unwrap_err();
+    assert!(err.contains("InputArg") || err.contains("arg 0"), "{err}");
 }
 
 /// 免费 profiler（D2 买单）：写频与触发计数零边际产出。
@@ -699,4 +985,60 @@ fn self_ref_fast_path_from_core_ast() {
 
     assert_eq!(rt.read(u1, f_hp), Value::Int(100));
     assert_eq!(rt.read(u2, f_hp), Value::Int(93));
+}
+
+/// OQ2：投影侧标量四则——封闭集（new/old/own/const）算术，投影发生在命中之后、
+/// 不破成本不变量。常量臂 new*2、活字段臂 new*own(factor) 与直接 New 取值臂共用
+/// 同一份条件 Expr 编译器（编译器单一真源）。
+#[test]
+fn projection_side_arithmetic_delivers_computed_values() {
+    let mut rt = Runtime::new();
+    let unit = entity(
+        &mut rt,
+        "Unit",
+        vec![
+            field("src", 0),
+            field("factor", 3),
+            field("dbl", 0),
+            field("scaled", 0),
+            field("plain", 0),
+        ],
+    );
+    let src = rt.field(unit, "src");
+    let factor = rt.field(unit, "factor");
+    let dbl = rt.field(unit, "dbl");
+    let scaled = rt.field(unit, "scaled");
+    let plain = rt.field(unit, "plain");
+
+    register(
+        &mut rt,
+        "scale",
+        unit,
+        Predicate::new(
+            own(src),
+            Cond::True,
+            Delivery::Each(vec![
+                Proj::Expr(Expr::Mul(Box::new(new_val()), Box::new(val(2)))),
+                Proj::Expr(Expr::Mul(Box::new(new_val()), Box::new(own_field(factor)))),
+                new_proj(),
+            ]),
+        ),
+        &[dbl, scaled, plain],
+        move |ctx, input| {
+            ctx.write(dbl, input.arg(0).clone());
+            ctx.write(scaled, input.arg(1).clone());
+            ctx.write(plain, input.arg(2).clone());
+        },
+    )
+    .unwrap();
+
+    let u = rt.spawn(unit, vec![(src, Value::Int(0)), (factor, Value::Int(3))]);
+    rt.step(); // 出生写路由
+    rt.debug_write(u, src, Value::Int(5));
+    rt.step();
+
+    // 算术臂产出 Float（与条件侧四则同语义）；直接取值臂保持原值类型。
+    assert_eq!(rt.read(u, dbl), Value::Float(10.0), "new*2");
+    assert_eq!(rt.read(u, scaled), Value::Float(15.0), "new*own(factor)");
+    assert_eq!(rt.read(u, plain), Value::Int(5), "直接 New 臂不变");
 }

@@ -20,6 +20,8 @@ pub struct Clock {
     pub f_frame: FieldId,
     pub f_alarm: FieldId,
     alarms: HashMap<u64, Vec<Value>>,
+    pending_alarms: usize,
+    alarm_limit: Option<usize>,
 }
 
 impl Clock {
@@ -34,6 +36,8 @@ impl Clock {
             f_frame: FieldId(0),
             f_alarm: FieldId(0),
             alarms: HashMap::new(),
+            pending_alarms: 0,
+            alarm_limit: None,
         }
     }
 
@@ -49,11 +53,36 @@ impl Clock {
             f_frame,
             f_alarm,
             alarms: HashMap::new(),
+            pending_alarms: 0,
+            alarm_limit: None,
         }
     }
 
-    pub(crate) fn set_alarm(&mut self, at_frame: u64, payload: Value) {
+    pub(crate) fn set_alarm_limit(&mut self, limit: Option<usize>) {
+        self.alarm_limit = limit;
+    }
+
+    pub(crate) fn pending_alarms(&self) -> usize {
+        self.pending_alarms
+    }
+
+    pub(crate) fn try_set_alarm(&mut self, at_frame: u64, payload: Value) -> Result<(), String> {
+        if let Some(limit) = self.alarm_limit
+            && self.pending_alarms >= limit
+        {
+            return Err(format!(
+                "pending alarm quota exceeded: {} >= {}",
+                self.pending_alarms, limit
+            ));
+        }
         self.alarms.entry(at_frame).or_default().push(payload);
+        self.pending_alarms += 1;
+        Ok(())
+    }
+
+    pub(crate) fn set_alarm(&mut self, at_frame: u64, payload: Value) {
+        self.try_set_alarm(at_frame, payload)
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     /// 每帧由 runtime 调用：产出 Clock.frame 写；到点的 alarm 逐条产出写
@@ -69,6 +98,7 @@ impl Clock {
             new,
         });
         if let Some(payloads) = self.alarms.remove(&frame) {
+            self.pending_alarms = self.pending_alarms.saturating_sub(payloads.len());
             let old = store.read(self.inst, self.f_alarm);
             for p in payloads {
                 w.push(WriteRec {

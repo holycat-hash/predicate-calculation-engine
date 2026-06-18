@@ -256,7 +256,7 @@ impl KernelColumn {
         match self {
             KernelColumn::Bool(v) => v.get(lane).map(|&v| if v { 1.0 } else { 0.0 }),
             KernelColumn::Int(v) => v.get(lane).map(|&v| v as f64),
-            KernelColumn::Float(v) => v.get(lane).copied(),
+            KernelColumn::Float(v) => v.get(lane).copied().filter(|x| !x.is_nan()),
             _ => self.get(lane).as_f64(),
         }
     }
@@ -838,5 +838,11 @@ impl<'rt> Ctx<'rt> {
 }
 
 /// calculation 本体：任意图灵完备代码，签名固定为 (ctx, input)。
+///
+/// 这是受信边界：闭包必须 effect-confined，所有可观察效果都经由 `ctx`
+/// 的 write / spawn / destroy_self 表达。日志、全局状态、外部 RNG、I/O 等
+/// ambient 副作用不受 runtime 调度不变量保护。需要机检副作用封闭时，使用
+/// [`crate::runtime::Tier::Kernel`] + [`KernelIr`] 子集。
+///
 /// Send + Sync：执行阶段零序约束下可任意并行调度（D1 + 写局部性保证无竞争）。
 pub type CalcFn = Box<dyn Fn(&mut Ctx, &Input) + Send + Sync>;

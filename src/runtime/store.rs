@@ -135,7 +135,10 @@ impl Store {
     }
 
     pub(crate) fn try_field(&self, ty: EntityTypeId, name: &str) -> Result<FieldId, String> {
-        let t = &self.types[ty.0 as usize];
+        let t = self
+            .types
+            .get(ty.0 as usize)
+            .ok_or_else(|| format!("无类型 id {}", ty.0))?;
         t.fields
             .iter()
             .position(|f| f.name == name)
@@ -209,10 +212,11 @@ impl Store {
         v
     }
 
-    pub(crate) fn set(&mut self, inst: InstanceId, field: FieldId, v: Value) {
+    pub(crate) fn set(&mut self, inst: InstanceId, field: FieldId, v: Value) -> bool {
         if let Some((t, r)) = self.row_of(inst) {
-            self.types[t].cols[field.0 as usize].set(r, v);
+            return self.types[t].cols[field.0 as usize].set(r, v);
         }
+        false
     }
 
     pub(crate) fn alloc(&mut self, ty: EntityTypeId) -> InstanceId {

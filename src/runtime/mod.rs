@@ -179,6 +179,8 @@ pub struct Profile {
     pub last_writes: usize,
     /// 上一帧触发集大小 |F|。
     pub last_triggers: usize,
+    /// 类型化列因异构写入退回 Boxed 的次数。
+    pub boxify_events: u64,
     write_counts: HashMap<(EntityTypeId, FieldId), u64>,
     trigger_counts: Vec<u64>,
 }
@@ -555,12 +557,33 @@ impl Runtime {
         self.clock.set_alarm(at_frame, payload);
     }
 
+    /// fallible 版本：触发 alarm 配额时返回 Err，不 panic。
+    pub fn try_set_alarm(&mut self, at_frame: u64, payload: Value) -> Result<(), String> {
+        self.clock.try_set_alarm(at_frame, payload)
+    }
+
     /// 相对当前帧排程：`frames` 帧后触发（at = `frame()` + frames）。alarm 在 tick(at)
     /// 时写出，故 `frames == 0` 指向已 tick 的当前帧、不会触发；常用 `frames >= 1`。
     /// 极大间隔在 `u64::MAX` 饱和，避免 release 回绕到过去帧。
     pub fn set_alarm_in(&mut self, frames: u64, payload: Value) {
         self.clock
             .set_alarm(self.frame.saturating_add(frames), payload);
+    }
+
+    /// fallible 相对排程版本：触发 alarm 配额时返回 Err，不 panic。
+    pub fn try_set_alarm_in(&mut self, frames: u64, payload: Value) -> Result<(), String> {
+        self.clock
+            .try_set_alarm(self.frame.saturating_add(frames), payload)
+    }
+
+    /// 设置待触发 alarm 总条数上限。`None` 为默认无上限。
+    pub fn set_alarm_limit(&mut self, limit: Option<usize>) {
+        self.clock.set_alarm_limit(limit);
+    }
+
+    /// 当前尚未触发的 alarm 条数。
+    pub fn pending_alarms(&self) -> usize {
+        self.clock.pending_alarms()
     }
 
     /// 注册 calculation 及其唯一前置 predicate（单谓词制，§1.4），默认档位。
@@ -600,6 +623,13 @@ impl Runtime {
         }
         if groups.len() > 1 && !matches!(pred.delivery, Delivery::Each(_)) {
             return Err("合取 scope 暂仅支持 each 交付（batch/fold 下的合取语义未定，§8）".into());
+        }
+        if groups.len() > route::MAX_CONJUNCTION_GROUPS {
+            return Err(format!(
+                "合取组数 {} 超上限 {}：把中间合取量物化为 entity（§6.1）",
+                groups.len(),
+                route::MAX_CONJUNCTION_GROUPS
+            ));
         }
 
         // D1 单写者冲突检查。先校验、后挂接，保证 Err 路径不污染 runtime。
@@ -871,7 +901,9 @@ impl Runtime {
         );
         self.spawn_queue.extend(spawns);
         for rec in &clock_writes {
-            self.store.set(rec.inst, rec.field, rec.new.clone());
+            if self.store.set(rec.inst, rec.field, rec.new.clone()) {
+                self.profile.boxify_events += 1;
+            }
         }
         // 帧边界：提交 + 生命周期结算
         self.commit(exec_buf);
@@ -902,7 +934,9 @@ impl Runtime {
             &old,
             &v,
         );
-        self.store.set(inst, field, v.clone());
+        if self.store.set(inst, field, v.clone()) {
+            self.profile.boxify_events += 1;
+        }
         self.pending.push(WriteRec {
             inst,
             field,
@@ -994,7 +1028,9 @@ impl Runtime {
                 &rec.old,
                 &rec.new,
             );
-            self.store.set(rec.inst, rec.field, rec.new.clone());
+            if self.store.set(rec.inst, rec.field, rec.new.clone()) {
+                self.profile.boxify_events += 1;
+            }
             if rec.field == FIELD_ALIVE && rec.new == Value::Bool(false) {
                 deaths.push(rec.inst);
             }
@@ -1084,7 +1120,25 @@ fn run_triggers(
                 ir,
                 KernelBatch::new(store, &lanes, &inputs, group.residency),
             );
-            validate_kernel_output(ir, &output, lanes.len(), backend.name());
+            let output = match validate_kernel_output(ir, &output, lanes.len(), backend.name()) {
+                Ok(()) => output,
+                Err(msg) => {
+                    if detect == Detect::Strict {
+                        panic!("{msg}");
+                    }
+                    if detect == Detect::Warn {
+                        eprintln!("[PCE] {msg}；回退 scalar backend");
+                    }
+                    let scalar = ScalarKernelBackend;
+                    let output = scalar.run(
+                        ir,
+                        KernelBatch::new(store, &lanes, &inputs, group.residency),
+                    );
+                    validate_kernel_output(ir, &output, lanes.len(), scalar.name())
+                        .expect("core scalar backend 必满足 KernelIr 输出契约");
+                    output
+                }
+            };
             for (lane, inst) in lanes.iter().enumerate() {
                 let writes = if store.alive(*inst) {
                     output.lane_writes(lane)
@@ -1184,34 +1238,39 @@ fn validate_kernel_output(
     output: &KernelBatchOutput,
     lanes: usize,
     backend_name: &str,
-) {
+) -> Result<(), String> {
     let expected: Vec<FieldId> = ir.writes().iter().map(|w| w.field).collect();
     let mut seen = HashSet::new();
     for w in output.writes() {
-        assert_eq!(
-            w.values.len(),
-            lanes,
-            "kernel backend {backend_name} returned a column with the wrong lane count"
-        );
-        assert!(
-            w.field != FIELD_ALIVE,
-            "kernel backend {backend_name} returned forbidden _alive output"
-        );
-        assert!(
-            expected.contains(&w.field),
-            "kernel backend {backend_name} returned a field not declared by KernelIr"
-        );
-        assert!(
-            seen.insert(w.field),
-            "kernel backend {backend_name} returned duplicate output field"
-        );
+        if w.values.len() != lanes {
+            return Err(format!(
+                "kernel backend {backend_name} returned a column with the wrong lane count"
+            ));
+        }
+        if w.field == FIELD_ALIVE {
+            return Err(format!(
+                "kernel backend {backend_name} returned forbidden _alive output"
+            ));
+        }
+        if !expected.contains(&w.field) {
+            return Err(format!(
+                "kernel backend {backend_name} returned a field not declared by KernelIr"
+            ));
+        }
+        if !seen.insert(w.field) {
+            return Err(format!(
+                "kernel backend {backend_name} returned duplicate output field"
+            ));
+        }
     }
     for field in expected {
-        assert!(
-            seen.contains(&field),
-            "kernel backend {backend_name} omitted a KernelIr output field"
-        );
+        if !seen.contains(&field) {
+            return Err(format!(
+                "kernel backend {backend_name} omitted a KernelIr output field"
+            ));
+        }
     }
+    Ok(())
 }
 
 fn check_field(store: &Store, ty: EntityTypeId, field: FieldId) -> Result<(), String> {
@@ -1365,6 +1424,29 @@ fn maintain_ref_reverse(
     old: &Value,
     new: &Value,
 ) {
+    maintain_ref_reverse_inner(store, ref_reverse, inst, field, old, new, false);
+}
+
+fn maintain_ref_reverse_for_route(
+    store: &Store,
+    ref_reverse: &mut RefReverse,
+    inst: InstanceId,
+    field: FieldId,
+    old: &Value,
+    new: &Value,
+) {
+    maintain_ref_reverse_inner(store, ref_reverse, inst, field, old, new, true);
+}
+
+fn maintain_ref_reverse_inner(
+    store: &Store,
+    ref_reverse: &mut RefReverse,
+    inst: InstanceId,
+    field: FieldId,
+    old: &Value,
+    new: &Value,
+    allow_dead_target: bool,
+) {
     if !store.is_ref_field(inst.ty, field) {
         return;
     }
@@ -1373,7 +1455,9 @@ fn maintain_ref_reverse(
     {
         set.remove(&(inst, field));
     }
-    if let Value::Ref(t) = new {
+    if let Value::Ref(t) = new
+        && (allow_dead_target || store.alive(*t))
+    {
         ref_reverse.entry(*t).or_default().insert((inst, field));
     }
 }
@@ -1391,7 +1475,7 @@ fn routing_ref_reverse(
     }
     let mut snapshot = current.clone();
     for rec in writes.iter().rev() {
-        maintain_ref_reverse(
+        maintain_ref_reverse_for_route(
             store,
             &mut snapshot,
             rec.inst,

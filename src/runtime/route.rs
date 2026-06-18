@@ -24,6 +24,9 @@ use crate::value::Value;
 
 use super::{Determinism, Indexes, RegisteredCalc, Store, Trigger, WriteRec};
 
+/// Conjunction latch uses bit 63 as the per-frame "already fired" sentinel.
+pub(crate) const MAX_CONJUNCTION_GROUPS: usize = 63;
+
 // ---- fold 增量状态（§3.4）----
 
 /// sum/count 可逆（±delta，O(1)/写）；min/max 非可逆，用多重集
@@ -63,8 +66,9 @@ fn ms_dec(counts: &mut BTreeMap<u64, u32>, k: u64) {
     }
 }
 
-/// f64 → 可全序比较的位键（单调映射，NaN 排两端）。
+/// f64 → 可全序比较的位键（单调映射）。调用方不把 NaN 作为 fold 贡献。
 fn f2k(f: f64) -> u64 {
+    debug_assert!(!f.is_nan());
     let b = f.to_bits();
     if b >> 63 == 1 { !b } else { b ^ (1 << 63) }
 }
@@ -92,7 +96,7 @@ pub(crate) fn fold_init(op: FoldOp) -> FoldAcc {
 }
 
 fn apply_fold(op: FoldOp, st: &mut FoldAcc, w: &WriteRec) {
-    let new = w.new.as_f64();
+    let new = w.new.as_f64().filter(|x| !x.is_nan());
     let key = (w.inst, w.field);
     match (op, st) {
         (FoldOp::Sum, FoldAcc::Sum { acc, contrib }) => {
@@ -245,6 +249,7 @@ struct ThTable {
 
 impl ThTable {
     fn insert(&mut self, t: f64, eq_ok: bool, calc: CalcId, group: u32) {
+        debug_assert!(!t.is_nan());
         let i = self.t.partition_point(|&x| x < t);
         self.t.insert(i, t);
         self.meta.insert(i, ThMeta { eq_ok, calc, group });
@@ -334,7 +339,7 @@ impl TypeIndex {
                 }
                 // crossed(常量, dir) → 区间查询
                 Cond::Crossed(Expr::Val(ValRef::Const(v)), dir) => {
-                    if let Some(t) = v.as_f64() {
+                    if let Some(t) = v.as_f64().filter(|x| !x.is_nan()) {
                         match dir {
                             Dir::Down => self.cross_down.insert(t, false, calc, group),
                             Dir::Up => self.cross_up.insert(t, false, calc, group),
@@ -359,6 +364,9 @@ impl TypeIndex {
     }
 
     fn add_threshold(&mut self, op: CmpOp, t: f64, calc: CalcId, group: u32) -> bool {
+        if t.is_nan() {
+            return false;
+        }
         match op {
             CmpOp::Lt => self.lt.insert(t, false, calc, group),
             CmpOp::Le => self.lt.insert(t, true, calc, group),
@@ -394,7 +402,10 @@ impl TypeIndex {
                 }
             }
         }
-        let (new, old) = (w.new.as_f64(), w.old.as_f64());
+        let (new, old) = (
+            w.new.as_f64().filter(|x| !x.is_nan()),
+            w.old.as_f64().filter(|x| !x.is_nan()),
+        );
         if let Some(n) = new {
             // lt 表：fires when n < t（或 ≤）——后缀 [partition_point ..)。二分只扫 .t
             let i = self.lt.t.partition_point(|&t| t < n);
@@ -488,8 +499,8 @@ pub(crate) struct Scratch {
     /// batch 私有帧缓冲。行携带规范序键（C4 Canonical 时排序，Free 时忽略）。
     batch_buf: HashMap<(CalcId, InstanceId), ScratchBatchRows>,
     batch_order: Vec<(CalcId, InstanceId)>,
-    /// `&` 合取闩（§4）：每 (谓词, 订阅者) 每帧位码；最高位 = 本帧已触发。
-    latch: HashMap<(CalcId, InstanceId), u32>,
+    /// `&` 合取闩（§4）：每 (谓词, 订阅者) 每帧位码；bit 63 = 本帧已触发。
+    latch: HashMap<(CalcId, InstanceId), u64>,
     fold_hits: Vec<(CalcId, InstanceId)>,
     fold_seen: HashSet<(CalcId, InstanceId)>,
     /// 等价合并 memo：sub-independent 条件按等价类每写求值一次。
@@ -704,14 +715,15 @@ fn deliver(
     // 合取闩（§4「& 合取」行）：组数 >1 时须同帧集齐全部组才触发（一次/帧）。
     // 诚实条款：`&` 要求帧完整写集，是路由内部唯一的流水化屏障。
     if rc.n_groups > 1 {
-        let bits = scratch.latch.entry((c, sub)).or_insert(0);
-        *bits |= 1 << group;
-        let full = (1u32 << rc.n_groups) - 1;
-        let fired = 1u32 << 31;
-        if *bits & full != full || *bits & fired != 0 {
+        debug_assert!((rc.n_groups as usize) <= MAX_CONJUNCTION_GROUPS);
+        let bits = scratch.latch.entry((c, sub)).or_insert(0u64);
+        *bits |= 1u64 << group;
+        let full = (1u64 << rc.n_groups) - 1;
+        const FIRED: u64 = 1u64 << 63;
+        if *bits & full != full || *bits & FIRED != 0 {
             return;
         }
-        *bits |= fired;
+        *bits |= FIRED;
     }
     match &rc.pred.delivery {
         Delivery::Each(_) => {

@@ -48,7 +48,7 @@ pub use clock::RenderClock;
 pub use ctx::{
     ContinuousFn, LocalContinuousFn, ReactionFn, RenderCtx, RenderInput, RenderLocalCtx,
 };
-pub use handoff::{Publisher, SimFrame, TrackedDelta};
+pub use handoff::{Publisher, PublisherConfig, PublisherStats, SimFrame, TrackedDelta};
 pub use interp::{Interp, Track};
 pub use local::{RenderLocalFieldDef, RenderLocalId, RenderLocalTypeId};
 pub use store::RFieldId;
@@ -225,6 +225,15 @@ impl RenderRuntime {
         self.store.add_render_field(ty, default)
     }
 
+    /// fallible 版本：非法 render 类型返回 Err。
+    pub fn try_add_render_field(
+        &mut self,
+        ty: EntityTypeId,
+        default: Value,
+    ) -> Result<RFieldId, String> {
+        self.store.try_add_render_field(ty, default)
+    }
+
     /// 注册一个 render-local 类型（粒子 / 飘字等）。本地类型完全由 render runtime
     /// 管理：字段在 render 命名空间，实例走本地池化 id，生命周期不回写 sim。
     pub fn register_local_type(
@@ -271,13 +280,15 @@ impl RenderRuntime {
             .sim_defaults
             .get(&(ty, sim_field))
             .cloned()
-            .unwrap_or(Value::Null);
+            .ok_or_else(|| format!("track 声明不存在 sim 字段 {}.{}", ty.0, sim_field.0))?;
         // 输出字段按插值种类定型（Vec3Lerp→Vec3 / Slerp→Quat / Lerp→Float / Snap·Step→源型），
         // 而非恒 Null——否则输出列落 Boxed，render 最热的每帧 transform 插值输出丢去装箱收益。
-        let out = self.store.add_render_field(ty, kind.out_default(&default));
+        let out = self
+            .store
+            .try_add_render_field(ty, kind.out_default(&default))?;
         // 输出字段走 D1 登记（out 恒为新铸 id，但宿主可手构 RFieldId 抢注，故仍检查）。
         self.claim_writes(ty, &[out], &format!("track({}.{})", ty.0, sim_field.0))?;
-        let slot = self.store.add_track(ty, sim_field, default);
+        let slot = self.store.try_add_track(ty, sim_field, default)?;
         let idx = self.tracks.len();
         self.tracks.push(Track {
             ty,
@@ -304,6 +315,15 @@ impl RenderRuntime {
         writes: &[RFieldId],
         f: ReactionFn,
     ) -> Result<(), String> {
+        if !self.store.has_type(ty) {
+            return Err(format!("render reaction {name} 声明不存在类型 {}", ty.0));
+        }
+        if !self.sim_defaults.contains_key(&(ty, sim_field)) {
+            return Err(format!(
+                "render reaction {name} 声明不存在 sim 字段 {}.{}",
+                ty.0, sim_field.0
+            ));
+        }
         validate_reaction_cond(&cond)?;
         validate_reaction_projs(&projs)?;
         self.claim_writes(ty, writes, name)?;
@@ -332,6 +352,9 @@ impl RenderRuntime {
         writes: &[RFieldId],
         f: ContinuousFn,
     ) -> Result<(), String> {
+        if !self.store.has_type(ty) {
+            return Err(format!("render continuous {name} 声明不存在类型 {}", ty.0));
+        }
         self.claim_writes(ty, writes, name)?;
         self.continuous.push(Continuous {
             name: name.to_string(),

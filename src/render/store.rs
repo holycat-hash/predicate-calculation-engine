@@ -98,23 +98,49 @@ impl RenderStore {
     /// 在某类型上注册一个 render 字段，返回其 [`RFieldId`]。列按 `default` 定型
     /// （类型化无装箱——`track` 据插值种类传入 Vec3/Quat/Float 默认值即得去装箱列）。
     pub(crate) fn add_render_field(&mut self, ty: EntityTypeId, default: Value) -> RFieldId {
-        let t = &mut self.types[ty.0 as usize];
+        self.try_add_render_field(ty, default)
+            .unwrap_or_else(|e| panic!("{e}（add_render_field）"))
+    }
+
+    pub(crate) fn try_add_render_field(
+        &mut self,
+        ty: EntityTypeId,
+        default: Value,
+    ) -> Result<RFieldId, String> {
+        let t = self
+            .types
+            .get_mut(ty.0 as usize)
+            .ok_or_else(|| format!("无 render 类型 id {}", ty.0))?;
         let id = t.render_cols.len() as u32;
         let rows = t.slots.len();
         t.render_cols.push(Column::with_default(&default, rows));
         t.render_defaults.push(default);
-        RFieldId(id)
+        Ok(RFieldId(id))
     }
 
     /// 在某类型上注册一个 tracked sim 字段镜像，返回其局部 track 槽位下标。
     /// `default` 是该 sim 字段的 schema 默认值（出生 snap 用，并为 prev/cur 列定型）。
+    #[allow(dead_code)]
     pub(crate) fn add_track(
         &mut self,
         ty: EntityTypeId,
         sim_field: FieldId,
         default: Value,
     ) -> usize {
-        let t = &mut self.types[ty.0 as usize];
+        self.try_add_track(ty, sim_field, default)
+            .unwrap_or_else(|e| panic!("{e}（add_track）"))
+    }
+
+    pub(crate) fn try_add_track(
+        &mut self,
+        ty: EntityTypeId,
+        sim_field: FieldId,
+        default: Value,
+    ) -> Result<usize, String> {
+        let t = self
+            .types
+            .get_mut(ty.0 as usize)
+            .ok_or_else(|| format!("无 render 类型 id {}", ty.0))?;
         let rows = t.slots.len();
         let slot = t.tracks.len();
         t.tracks.push(TrackCol {
@@ -123,7 +149,7 @@ impl RenderStore {
             cur: Column::with_default(&default, rows),
             default,
         });
-        slot
+        Ok(slot)
     }
 
     pub(crate) fn has_type(&self, ty: EntityTypeId) -> bool {

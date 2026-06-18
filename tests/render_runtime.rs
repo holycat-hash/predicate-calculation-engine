@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use pce::predicate::type_scope;
 use pce::{
-    Cond, Delivery, FieldDef, Interp, Predicate, Proj, Publisher, RenderRuntime, Runtime, Value,
+    Cond, Delivery, EntityTypeId, FieldDef, FieldId, Interp, Predicate, Proj, Publisher,
+    RenderRuntime, Runtime, Value,
 };
 
 /// 规范消费：drain 全部未消费帧、顺序摄入（不丢生灭/事件），不推进 render 帧。
@@ -517,6 +518,69 @@ fn render_slower_than_sim_drains_all_no_ghost() {
         !rr.is_present(b),
         "死亡帧未被跳过：B 在 render 侧已回收，无幽灵"
     );
+}
+
+#[test]
+fn render_registration_rejects_invalid_type_without_panicking() {
+    let rt = Runtime::new();
+    let mut rr = RenderRuntime::new(&rt);
+    let bad_ty = EntityTypeId(999);
+    let bad_field = FieldId(0);
+
+    assert!(
+        rr.try_add_render_field(bad_ty, Value::Int(0)).is_err(),
+        "fallible render field registration should report invalid type"
+    );
+    assert!(
+        rr.track(bad_ty, bad_field, Interp::Snap).is_err(),
+        "track should report invalid sim field/type"
+    );
+    assert!(
+        rr.reaction(
+            "bad_reaction",
+            bad_ty,
+            bad_field,
+            Cond::True,
+            vec![],
+            false,
+            &[],
+            Box::new(|_, _| {}),
+        )
+        .is_err(),
+        "reaction with empty writes still validates type"
+    );
+    assert!(
+        rr.continuous("bad_continuous", bad_ty, &[], Box::new(|_| {}))
+            .is_err(),
+        "continuous with empty writes still validates type"
+    );
+}
+
+#[test]
+fn bounded_publisher_coalesces_tracked_backlog_and_reports_stats() {
+    let (mut rt, unit, f_pos, _f_vel) = sim_with_mover(10);
+    let mut rr = RenderRuntime::new(&rt);
+    let r_pos = rr.track(unit, f_pos, Interp::Lerp).unwrap();
+    let publisher = Publisher::with_queue_limit(rr.tracked_fields(), 2);
+    let u = rt.spawn(unit, vec![(f_pos, Value::Int(0))]);
+
+    for _ in 0..6 {
+        rt.step();
+        publisher.publish(&rt);
+    }
+
+    assert!(
+        publisher.queue_depth() <= 2,
+        "bounded publisher should keep queued frame count under the configured cap"
+    );
+    assert!(
+        publisher.stats().merged_frames > 0,
+        "publisher should report that backlog frames were merged"
+    );
+
+    pump(&mut rr, &publisher);
+    rr.render_frame(0.016, 1.0);
+    assert_eq!(rr.read(u, r_pos), Value::Float(50.0));
 }
 
 #[test]

@@ -43,6 +43,12 @@ fn new_proj() -> Proj {
     Proj::New(vec![])
 }
 
+fn and_scope(fields: &[FieldId]) -> Scope {
+    let mut it = fields.iter().copied().map(own);
+    let first = it.next().unwrap();
+    it.fold(first, |acc, f| Scope::And(Box::new(acc), Box::new(f)))
+}
+
 fn new_path_proj(path: &[&str]) -> Proj {
     Proj::New(path.iter().map(|s| s.to_string()).collect())
 }
@@ -111,6 +117,54 @@ fn threshold_table_routes_constant_cmp() {
     rt.debug_write(u, f_hp, Value::Int(9)); // 命中
     rt.step();
     assert_eq!(rt.read(w0, f_hits), Value::Int(2));
+}
+
+#[test]
+fn threshold_table_ignores_nan_constant_without_poisoning_order() {
+    let mut rt = Runtime::new();
+    let unit = entity(&mut rt, "Unit", vec![field("v", 0.0)]);
+    let watch = singleton(
+        &mut rt,
+        "Watch",
+        vec![field("gt10", 0), field("nan", 0), field("gt5", 0)],
+    );
+    let f_v = rt.field(unit, "v");
+    let gt10 = rt.field(watch, "gt10");
+    let nan = rt.field(watch, "nan");
+    let gt5 = rt.field(watch, "gt5");
+
+    for (name, threshold, out) in [
+        ("gt10", 10.0, gt10),
+        ("nan", f64::NAN, nan),
+        ("gt5", 5.0, gt5),
+    ] {
+        register(
+            &mut rt,
+            name,
+            watch,
+            Predicate::new(
+                type_scope(unit, f_v),
+                Cond::Cmp(new_val(), CmpOp::Gt, val(threshold)),
+                Delivery::Each(vec![]),
+            ),
+            &[out],
+            move |ctx, _| {
+                let n = ctx.read_own(out).as_i64().unwrap_or(0);
+                ctx.write(out, n + 1);
+            },
+        )
+        .unwrap();
+    }
+
+    let u = rt.spawn(unit, vec![]);
+    let w = rt.alive(watch)[0];
+    rt.step();
+    rt.debug_write(u, f_v, Value::Float(20.0));
+    rt.step();
+
+    assert_eq!(rt.read(w, gt10), Value::Int(1));
+    assert_eq!(rt.read(w, gt5), Value::Int(1));
+    assert_eq!(rt.read(w, nan), Value::Int(0));
 }
 
 /// type scope + crossed(常量) → 阈值表区间查询；边沿语义保持。
@@ -297,6 +351,42 @@ fn fold_min_recovers_after_member_rises() {
     rt.debug_write(e1, f_hp, Value::Int(20)); // 最小成员回升
     rt.step();
     assert_eq!(rt.read(b0, f_weakest), Value::Float(10.0));
+}
+
+#[test]
+fn fold_sum_treats_nan_as_no_contribution_and_recovers() {
+    let mut rt = Runtime::new();
+    let enemy = entity(&mut rt, "Enemy", vec![field("hp", 0.0)]);
+    let bar = singleton(&mut rt, "Bar", vec![field("total", ())]);
+    let f_hp = rt.field(enemy, "hp");
+    let f_total = rt.field(bar, "total");
+
+    register(
+        &mut rt,
+        "total",
+        bar,
+        Predicate::new(
+            type_scope(enemy, f_hp),
+            Cond::True,
+            Delivery::Fold(FoldOp::Sum),
+        ),
+        &[f_total],
+        move |ctx, input| ctx.write(f_total, input.agg().clone()),
+    )
+    .unwrap();
+
+    let e = rt.spawn(enemy, vec![(f_hp, Value::Float(1.0))]);
+    let b0 = rt.alive(bar)[0];
+    rt.step();
+    assert_eq!(rt.read(b0, f_total), Value::Float(1.0));
+
+    rt.debug_write(e, f_hp, Value::Float(f64::NAN));
+    rt.step();
+    assert_eq!(rt.read(b0, f_total), Value::Float(0.0));
+
+    rt.debug_write(e, f_hp, Value::Float(2.0));
+    rt.step();
+    assert_eq!(rt.read(b0, f_total), Value::Float(2.0));
 }
 
 /// C6 压缩行：死亡 swap-remove 重映射后，幸存实例数据不动、
@@ -656,6 +746,7 @@ fn kernel_backend_receives_grouped_soa_batch() {
 #[should_panic(expected = "forbidden _alive")]
 fn kernel_backend_cannot_smuggle_lifecycle_writes() {
     let mut rt = Runtime::new();
+    rt.set_detect(Detect::Strict);
     rt.register_kernel_backend(Box::new(KillBackend));
     let unit = entity(&mut rt, "Unit", vec![field("src", 0), field("out", 0)]);
     let src = rt.field(unit, "src");
@@ -680,6 +771,43 @@ fn kernel_backend_cannot_smuggle_lifecycle_writes() {
     rt.step();
     rt.debug_write(u, src, Value::Int(1));
     rt.step();
+}
+
+#[test]
+fn invalid_kernel_backend_output_falls_back_to_scalar_when_not_strict() {
+    let mut rt = Runtime::new();
+    rt.set_detect(Detect::Warn);
+    rt.register_kernel_backend(Box::new(KillBackend));
+    let unit = entity(&mut rt, "Unit", vec![field("src", 0), field("out", 0)]);
+    let src = rt.field(unit, "src");
+    let out = rt.field(unit, "out");
+    register_opt(
+        &mut rt,
+        "legal_kernel",
+        unit,
+        Predicate::new(own(src), Cond::True, Delivery::Each(vec![])),
+        &[out],
+        CalcOptions::default()
+            .tier(Tier::Kernel)
+            .kernel_ir(KernelIr::new(vec![KernelWrite::new(
+                out,
+                vec![KernelOp::Const(Value::Int(7))],
+            )])),
+        move |_, _| panic!("kernel backend path must not call closure fallback"),
+    )
+    .unwrap();
+
+    let u = rt.spawn(unit, vec![]);
+    rt.step();
+    rt.debug_write(u, src, Value::Int(1));
+    rt.step();
+
+    assert_eq!(rt.read(u, out), Value::Int(7));
+    assert_eq!(
+        rt.read(u, pce::entity::FIELD_ALIVE),
+        Value::Bool(true),
+        "bad backend _alive output was rejected instead of killing the lane"
+    );
 }
 
 /// Kernel IR 注册期校验：写集与读集都能被机检。
@@ -777,6 +905,20 @@ fn profiler_counts_writes_and_triggers() {
     assert!(!p.hot_cells().is_empty());
 }
 
+#[test]
+fn profiler_counts_boxify_events() {
+    let mut rt = Runtime::new();
+    let unit = entity(&mut rt, "Unit", vec![field("v", 0)]);
+    let f_v = rt.field(unit, "v");
+    let u = rt.spawn(unit, vec![]);
+    rt.step();
+
+    rt.debug_write(u, f_v, Value::Float(1.5));
+
+    assert_eq!(rt.profile().boxify_events, 1);
+    assert_eq!(rt.read(u, f_v), Value::Float(1.5));
+}
+
 /// 核心注册 API 的 D1 校验：冲突经 Result 报错（不 panic）。
 #[test]
 fn core_registration_reports_d1_conflict() {
@@ -858,6 +1000,66 @@ fn failed_registration_does_not_poison_runtime() {
     rt.step();
     rt.debug_write(u, f_v, Value::Int(1));
     rt.step(); // 若索引被污染，这里会路由到不存在的 CalcId 并 panic。
+}
+
+#[test]
+fn try_field_reports_invalid_type_id_instead_of_panicking() {
+    let rt = Runtime::new();
+    let err = rt.try_field(EntityTypeId(999), "missing").unwrap_err();
+    assert!(err.contains("无类型 id 999"), "{err}");
+}
+
+#[test]
+fn conjunction_scope_allows_63_groups_and_fires_once() {
+    let mut rt = Runtime::new();
+    let mut defs: Vec<FieldDef> = (0..63).map(|i| field(&format!("g{i}"), 0)).collect();
+    defs.push(field("hits", 0));
+    let unit = entity(&mut rt, "Unit", defs);
+    let groups: Vec<FieldId> = (1..=63).map(FieldId).collect();
+    let hits = rt.field(unit, "hits");
+
+    register(
+        &mut rt,
+        "wide_and",
+        unit,
+        Predicate::new(and_scope(&groups), Cond::True, Delivery::Each(vec![])),
+        &[hits],
+        move |ctx, _| {
+            let n = ctx.read_own(hits).as_i64().unwrap_or(0);
+            ctx.write(hits, n + 1);
+        },
+    )
+    .unwrap();
+
+    let u = rt.spawn(unit, vec![]);
+    rt.step();
+    for f in &groups {
+        rt.debug_write(u, *f, Value::Int(1));
+    }
+    rt.step();
+    assert_eq!(rt.read(u, hits), Value::Int(1));
+
+    rt.debug_write(u, groups[0], Value::Int(2));
+    rt.step();
+    assert_eq!(rt.read(u, hits), Value::Int(1));
+}
+
+#[test]
+fn conjunction_scope_rejects_more_than_63_groups() {
+    let mut rt = Runtime::new();
+    let defs: Vec<FieldDef> = (0..64).map(|i| field(&format!("g{i}"), 0)).collect();
+    let unit = entity(&mut rt, "Unit", defs);
+    let groups: Vec<FieldId> = (1..=64).map(FieldId).collect();
+    let err = register(
+        &mut rt,
+        "too_wide_and",
+        unit,
+        Predicate::new(and_scope(&groups), Cond::True, Delivery::Each(vec![])),
+        &[],
+        |_, _| {},
+    )
+    .unwrap_err();
+    assert!(err.contains("合取组数") && err.contains("63"), "{err}");
 }
 
 /// OR scope 中重复原子不应让同一 write 重复交付。

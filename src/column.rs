@@ -69,7 +69,7 @@ impl Column {
     }
 
     /// 写一格。值与列类型不符 → 去优化为 Boxed 再写（一次性，正确性优先）。
-    pub(crate) fn set(&mut self, row: usize, v: Value) {
+    pub(crate) fn set(&mut self, row: usize, v: Value) -> bool {
         match (&mut *self, &v) {
             (Column::Bool(c), Value::Bool(b)) => c[row] = *b,
             (Column::Int(c), Value::Int(i)) => c[row] = *i,
@@ -82,8 +82,10 @@ impl Column {
                 if let Column::Boxed(c) = self {
                     c[row] = v;
                 }
+                return true;
             }
         }
+        false
     }
 
     /// 追加一行。

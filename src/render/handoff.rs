@@ -49,26 +49,67 @@ pub struct SimFrame {
 /// `ingest`：生灭事件无丢失，插值自然落在最后一帧的区间。sim 远快于 render 时：所有
 /// 事件照常处理，只画最新插值态——正是「render 跟不上」时该有的行为（DF3）。
 ///
-/// **队列界（B5）。** 队列长度 = 未 drain 的 sim 帧数：render 每帧 drain ⇒ 常态有界；
-/// 但 render **真停摆**（线程阻塞 / 长时间不 drain）时队列按 sim 帧数线性增长。缓解留作
-/// seam——把跳过的帧**合并**（生灭 / 事件按序追加、tracked 增量 latest-wins 折叠）成更少
-/// 的 `SimFrame`，令停摆期内存与「跳过多少帧」无关、只与「多少实体在动」有关；v1 未做
-/// （常态每帧 drain 不触发）。
+/// **队列界（B5）。** 默认 `new` 保持旧版无界行为；需要硬约束时用
+/// [`Publisher::with_queue_limit`] / [`Publisher::with_config`]。达到上限后 publisher
+/// 会把 backlog 合并为更少的 `SimFrame`：tracked 增量 first-old / latest-new 折叠，
+/// 生灭与事件写日志保留在合并帧里，并通过 [`Publisher::stats`] 暴露合并遥测。注意事件本身
+/// 不可丢；若停摆期间事件量无限增长，宿主仍应结合 stats 做降级或切 keyframe 策略。
 ///
 /// 用 `Mutex<Vec>` 守一次队列操作，临界区只是 Vec 的 push / swap——render 取走后整个
 /// 插值区间不再加锁。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PublisherConfig {
+    /// 未消费帧数达到该上限时，把 backlog lossless 合并成一帧。`None` 保持旧版无界行为。
+    pub max_queued_frames: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PublisherStats {
+    pub queued_frames: usize,
+    pub published_frames: u64,
+    pub merged_frames: u64,
+    pub max_queue_len: usize,
+}
+
+#[derive(Default)]
+struct PublisherState {
+    queue: Vec<Arc<SimFrame>>,
+    stats: PublisherStats,
+}
+
 pub struct Publisher {
     /// render 关心的 tracked cell 集（注册期定型）：(类型, sim 字段)。
     tracked_fields: Vec<(EntityTypeId, FieldId)>,
+    config: PublisherConfig,
     /// 未被 render 消费的已发布帧（顺序）。长度 = 未 drain 的 sim 帧数（见 [`Publisher`] 队列界 B5）。
-    queue: Mutex<Vec<Arc<SimFrame>>>,
+    queue: Mutex<PublisherState>,
 }
 
 impl Publisher {
     pub fn new(tracked_fields: Vec<(EntityTypeId, FieldId)>) -> Self {
+        Self::with_config(tracked_fields, PublisherConfig::default())
+    }
+
+    pub fn with_queue_limit(
+        tracked_fields: Vec<(EntityTypeId, FieldId)>,
+        max_queued_frames: usize,
+    ) -> Self {
+        Self::with_config(
+            tracked_fields,
+            PublisherConfig {
+                max_queued_frames: Some(max_queued_frames.max(1)),
+            },
+        )
+    }
+
+    pub fn with_config(
+        tracked_fields: Vec<(EntityTypeId, FieldId)>,
+        config: PublisherConfig,
+    ) -> Self {
         Publisher {
             tracked_fields,
-            queue: Mutex::new(vec![]),
+            config,
+            queue: Mutex::new(PublisherState::default()),
         }
     }
 
@@ -114,12 +155,65 @@ impl Publisher {
             }
             frame.events.push(rec.clone());
         }
-        self.queue.lock().unwrap().push(Arc::new(frame));
+        self.enqueue(frame);
+    }
+
+    fn enqueue(&self, frame: SimFrame) {
+        let mut state = self.queue.lock().unwrap();
+        state.stats.published_frames += 1;
+        if let Some(max) = self.config.max_queued_frames
+            && state.queue.len() >= max
+        {
+            let mut frames = std::mem::take(&mut state.queue);
+            frames.push(Arc::new(frame));
+            let merged_count = frames.len() as u64;
+            state.queue.push(Arc::new(merge_frames(frames)));
+            state.stats.merged_frames += merged_count;
+            state.stats.max_queue_len = state.stats.max_queue_len.max(state.queue.len());
+            return;
+        }
+        state.queue.push(Arc::new(frame));
+        state.stats.max_queue_len = state.stats.max_queue_len.max(state.queue.len());
     }
 
     /// render 线程取走全部未消费帧（顺序）。逐帧 `ingest` 以不丢生灭/事件；
     /// 插值落在最后一帧。无新帧则返回空。
     pub fn drain(&self) -> Vec<Arc<SimFrame>> {
-        std::mem::take(&mut *self.queue.lock().unwrap())
+        let mut state = self.queue.lock().unwrap();
+        let drained = std::mem::take(&mut state.queue);
+        state.stats.queued_frames = 0;
+        drained
     }
+
+    pub fn queue_depth(&self) -> usize {
+        self.queue.lock().unwrap().queue.len()
+    }
+
+    pub fn stats(&self) -> PublisherStats {
+        let state = self.queue.lock().unwrap();
+        let mut stats = state.stats.clone();
+        stats.queued_frames = state.queue.len();
+        stats
+    }
+}
+
+fn merge_frames(frames: Vec<Arc<SimFrame>>) -> SimFrame {
+    let mut out = SimFrame::default();
+    let mut tracked_of: HashMap<(InstanceId, FieldId), usize> = HashMap::new();
+    for frame in frames {
+        out.sim_frame = frame.sim_frame;
+        for d in &frame.tracked {
+            let key = (d.inst, d.sim_field);
+            if let Some(&i) = tracked_of.get(&key) {
+                out.tracked[i].new = d.new.clone();
+            } else {
+                tracked_of.insert(key, out.tracked.len());
+                out.tracked.push(d.clone());
+            }
+        }
+        out.events.extend(frame.events.iter().cloned());
+        out.births.extend(frame.births.iter().copied());
+        out.deaths.extend(frame.deaths.iter().copied());
+    }
+    out
 }

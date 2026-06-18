@@ -116,3 +116,21 @@ fn relative_alarm_saturates_instead_of_overflowing() {
         "overflowing relative alarms must not wrap into an immediate/past frame"
     );
 }
+
+#[test]
+fn alarm_quota_is_observable_and_try_api_returns_err() {
+    let mut rt = Runtime::new();
+    rt.set_alarm_limit(Some(2));
+    rt.try_set_alarm(10, Value::Int(1)).unwrap();
+    rt.try_set_alarm(11, Value::Int(2)).unwrap();
+    assert_eq!(rt.pending_alarms(), 2);
+
+    let err = rt.try_set_alarm(12, Value::Int(3)).unwrap_err();
+    assert!(err.contains("quota"), "{err}");
+    assert_eq!(rt.pending_alarms(), 2);
+
+    for _ in 0..10 {
+        rt.step();
+    }
+    assert_eq!(rt.pending_alarms(), 1);
+}

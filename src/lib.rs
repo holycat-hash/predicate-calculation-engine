@@ -84,7 +84,9 @@ pub use entity::{CellAddr, EntityTypeId, FieldDef, FieldId, InstanceId};
 pub use predicate::{CmpOp, Cond, Delivery, Dir, Expr, FoldOp, Predicate, Proj, Scope, ValRef};
 pub use render::{
     lod_band, Axes, CullShape, Interp, Publisher, RFieldId, RenderBinding, RenderClock, RenderCtx,
-    RenderInput, RenderPacket, RenderRuntime, SimFrame, SubmissionView,
+    RenderInput, RenderPacket, RenderRuntime, SimFrame, SubmissionInstanceKey,
+    SubmissionInstanceLayout, SubmissionInstanceRow, SubmissionInstanceSlot, SubmissionInstanceSpan,
+    SubmissionInstanceStream, SubmissionView,
 };
 pub use runtime::{
     CalcOptions, Detect, Determinism, Profile, Residency, RowPolicy, Runtime, Schedule,

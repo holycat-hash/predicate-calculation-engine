@@ -48,7 +48,11 @@ pub use ctx::{ContinuousFn, ReactionFn, RenderCtx, RenderInput};
 pub use handoff::{Publisher, SimFrame, TrackedDelta};
 pub use interp::{Interp, Track};
 pub use store::RFieldId;
-pub use submission::{RenderBinding, RenderPacket, SubmissionView};
+pub use submission::{
+    RenderBinding, RenderPacket, SubmissionInstanceKey, SubmissionInstanceLayout,
+    SubmissionInstanceRow, SubmissionInstanceSlot, SubmissionInstanceSpan, SubmissionInstanceStream,
+    SubmissionView,
+};
 pub use visible::{Axes, CullShape, lod_band};
 
 use std::collections::{HashMap, HashSet};

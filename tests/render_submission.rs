@@ -1,4 +1,4 @@
-//! render runtime 渲染语义数据测试：结构化插值（Vec3Lerp / Slerp）、GPU 提交视图
+//! render runtime 渲染语义数据测试：结构化插值（Vec3Lerp / Slerp）、渲染提交视图
 //! 装配（transform / handle / 可见性剔除）、render 自管死亡淡出（延迟回收 + 重生夺
 //! 回行）、动画状态切换 + 进度推进（三类原语组合，无第五概念）。
 //!
@@ -246,6 +246,489 @@ fn transform_track_flows_into_submission_packet() {
     assert_eq!(pkt.mesh, Value::Int(7), "mesh handle 装配");
     assert_eq!(pkt.material, Value::Int(3), "material handle 装配");
     assert!(approx(pkt.fade, 1.0), "存活实体实心 fade=1");
+
+    let rows = view.instance_rows();
+    assert_eq!(rows.len(), 1, "typed seam 与语义 packet 一一对应");
+    let row = &rows[0];
+    assert_eq!(row.translation_fade, [5.0, 0.0, 0.0, 1.0]);
+    assert_eq!(row.rotation, [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(
+        row.scale_phase,
+        [1.0, 1.0, 1.0, 0.0],
+        "未绑定 scale → 单位缩放"
+    );
+    assert_eq!(row.ids, [7, 3, 0, 0]);
+    assert_eq!(row.packet_index(), Some(0));
+    assert_eq!(view.packets[row.packet_index().unwrap()].inst, u);
+    assert_eq!(
+        row.affine3x4(),
+        [
+            [1.0, 0.0, 0.0, 5.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+        "同一 typed row 可直接喂 instance byte rows / trace instance transform"
+    );
+
+    let mut reused = vec![pce::SubmissionInstanceRow::default(); 4];
+    view.fill_instance_rows(&mut reused);
+    assert_eq!(reused, rows, "fill_instance_rows 允许调用方复用 Vec 分配");
+}
+
+#[test]
+fn submission_instance_row_defaults_are_byte_layout_friendly() {
+    let row = pce::SubmissionInstanceRow::default();
+    assert_eq!(std::mem::size_of::<pce::SubmissionInstanceRow>(), 64);
+    assert_eq!(pce::SubmissionInstanceRow::BYTE_LEN, 64);
+    assert_eq!(row.translation_fade, [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(row.rotation, [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(row.scale_phase, [1.0, 1.0, 1.0, 0.0]);
+    assert_eq!(row.ids, [0, 0, 0, u32::MAX]);
+    assert_eq!(row.packet_index(), None);
+    assert_eq!(row.translation(), [0.0, 0.0, 0.0]);
+    assert_eq!(row.fade(), 1.0);
+    assert_eq!(row.scale(), [1.0, 1.0, 1.0]);
+    assert_eq!(row.anim_phase(), 0.0);
+    assert_eq!(
+        row.key(),
+        pce::SubmissionInstanceKey {
+            mesh: 0,
+            material: 0,
+            anim_state: 0,
+        }
+    );
+}
+
+#[test]
+fn submission_instance_layout_names_stable_byte_slots() {
+    let layout = pce::SubmissionInstanceRow::LAYOUT;
+    assert_eq!(layout, pce::SubmissionInstanceLayout::default());
+    assert_eq!(layout.stride, pce::SubmissionInstanceRow::BYTE_LEN);
+    assert_eq!(layout.vec4_byte_len, 16);
+    assert_eq!(
+        layout.slot_range(pce::SubmissionInstanceSlot::TranslationFade),
+        0..16
+    );
+    assert_eq!(
+        layout.slot_range(pce::SubmissionInstanceSlot::Rotation),
+        16..32
+    );
+    assert_eq!(
+        layout.slot_range(pce::SubmissionInstanceSlot::ScalePhase),
+        32..48
+    );
+    assert_eq!(layout.slot_range(pce::SubmissionInstanceSlot::Ids), 48..64);
+    assert_eq!(layout.row_range(3), 192..256);
+
+    let row = pce::SubmissionInstanceRow {
+        translation_fade: [1.0, 2.0, 3.0, 0.5],
+        rotation: [4.0, 5.0, 6.0, 7.0],
+        scale_phase: [8.0, 9.0, 10.0, 0.25],
+        ids: [11, 12, 13, 14],
+    };
+    let bytes = row.to_le_bytes();
+    assert_eq!(
+        &bytes[layout.slot_range(pce::SubmissionInstanceSlot::TranslationFade)],
+        [1.0f32, 2.0, 3.0, 0.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>()
+            .as_slice()
+    );
+    assert_eq!(
+        &bytes[layout.slot_range(pce::SubmissionInstanceSlot::Ids)],
+        [11u32, 12, 13, 14]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+            .as_slice()
+    );
+}
+
+#[test]
+fn submission_instance_row_bytes_are_fixed_little_endian() {
+    let row = pce::SubmissionInstanceRow {
+        translation_fade: [1.0, 2.0, 3.0, 0.5],
+        rotation: [4.0, 5.0, 6.0, 7.0],
+        scale_phase: [8.0, 9.0, 10.0, 0.25],
+        ids: [11, 12, 13, 14],
+    };
+    let bytes = row.to_le_bytes();
+    assert_eq!(bytes.len(), pce::SubmissionInstanceRow::BYTE_LEN);
+
+    let f32_at = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    let u32_at = |i: usize| {
+        let start = 12 * 4 + i * 4;
+        u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap())
+    };
+    assert_eq!(
+        (0..12).map(f32_at).collect::<Vec<_>>(),
+        vec![1.0, 2.0, 3.0, 0.5, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 0.25]
+    );
+    assert_eq!((0..4).map(u32_at).collect::<Vec<_>>(), vec![11, 12, 13, 14]);
+
+    let mut appended = Vec::new();
+    row.append_le_bytes(&mut appended);
+    assert_eq!(appended, bytes);
+
+    let mut too_small = [9u8; 8];
+    assert!(!row.copy_le_bytes_to(&mut too_small));
+    assert_eq!(too_small, [9u8; 8], "小 slice 不应被部分写入");
+
+    let mut exact = [0u8; pce::SubmissionInstanceRow::BYTE_LEN];
+    assert!(row.copy_le_bytes_to(&mut exact));
+    assert_eq!(exact, bytes);
+}
+
+#[test]
+fn submission_instance_row_affine_bytes_are_row_major_rt_ready() {
+    let row = pce::SubmissionInstanceRow {
+        translation_fade: [1.0, 2.0, 3.0, 0.75],
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        scale_phase: [2.0, 3.0, 4.0, 0.25],
+        ids: [5, 6, 7, 8],
+    };
+    assert_eq!(
+        row.affine3x4(),
+        [
+            [2.0, 0.0, 0.0, 1.0],
+            [0.0, 3.0, 0.0, 2.0],
+            [0.0, 0.0, 4.0, 3.0],
+        ],
+        "RT / instance consumers see row-major affine 3x4"
+    );
+    assert_eq!(row.mesh_handle(), 5);
+    assert_eq!(row.material_handle(), 6);
+    assert_eq!(row.anim_state(), 7);
+    assert_eq!(row.anim_phase(), 0.25);
+    assert_eq!(
+        row.key(),
+        pce::SubmissionInstanceKey {
+            mesh: 5,
+            material: 6,
+            anim_state: 7,
+        }
+    );
+
+    let bytes = row.affine3x4_le_bytes();
+    assert_eq!(bytes.len(), pce::SubmissionInstanceRow::AFFINE3X4_BYTE_LEN);
+    let f32_at = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    assert_eq!(
+        (0..12).map(f32_at).collect::<Vec<_>>(),
+        vec![2.0, 0.0, 0.0, 1.0, 0.0, 3.0, 0.0, 2.0, 0.0, 0.0, 4.0, 3.0]
+    );
+
+    let mut too_small = [3u8; 8];
+    assert!(!row.copy_affine3x4_le_bytes_to(&mut too_small));
+    assert_eq!(too_small, [3u8; 8]);
+
+    let mut exact = [0u8; pce::SubmissionInstanceRow::AFFINE3X4_BYTE_LEN];
+    assert!(row.copy_affine3x4_le_bytes_to(&mut exact));
+    assert_eq!(exact, bytes);
+}
+
+#[test]
+fn submission_instance_rows_preserve_source_indices() {
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![FieldDef::new("x", Value::Int(0))], false);
+    let a = rt.spawn(unit, vec![]);
+    let b = rt.spawn(unit, vec![]);
+    let view = pce::SubmissionView {
+        packets: vec![
+            pce::RenderPacket {
+                inst: a,
+                translation: Value::Null,
+                rotation: Value::Null,
+                scale: Value::Null,
+                mesh: Value::Int(11),
+                material: Value::Int(21),
+                anim_state: Value::Int(31),
+                anim_phase: 0.0,
+                fade: 1.0,
+            },
+            pce::RenderPacket {
+                inst: b,
+                translation: Value::Null,
+                rotation: Value::Null,
+                scale: Value::Null,
+                mesh: Value::Int(12),
+                material: Value::Int(22),
+                anim_state: Value::Int(32),
+                anim_phase: 0.0,
+                fade: 1.0,
+            },
+        ],
+    };
+
+    let rows = view.instance_rows();
+    assert_eq!(rows.len(), view.len());
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.ids[3], i as u32);
+        assert_eq!(
+            view.packets[row.packet_index().unwrap()].inst,
+            view.packets[i].inst
+        );
+    }
+}
+
+#[test]
+fn submission_instance_stream_spans_contiguous_runs_without_reordering() {
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![FieldDef::new("x", Value::Int(0))], false);
+    let ids = [
+        rt.spawn(unit, vec![]),
+        rt.spawn(unit, vec![]),
+        rt.spawn(unit, vec![]),
+        rt.spawn(unit, vec![]),
+    ];
+    let packet = |inst, mesh, material, anim_state| pce::RenderPacket {
+        inst,
+        translation: Value::Null,
+        rotation: Value::Null,
+        scale: Value::Null,
+        mesh: Value::Int(mesh),
+        material: Value::Int(material),
+        anim_state: Value::Int(anim_state),
+        anim_phase: 0.0,
+        fade: 1.0,
+    };
+    let view = pce::SubmissionView {
+        packets: vec![
+            packet(ids[0], 2, 1, 0),
+            packet(ids[1], 2, 1, 0),
+            packet(ids[2], 1, 1, 3),
+            packet(ids[3], 2, 1, 0),
+        ],
+    };
+
+    let stream = view.instance_stream();
+    assert_eq!(stream.len(), view.len());
+    assert_eq!(
+        stream.rows.iter().map(|r| r.span_key()).collect::<Vec<_>>(),
+        vec![(2, 1, 0), (2, 1, 0), (1, 1, 3), (2, 1, 0)],
+        "stream rows 与 packets 同序，不替后端排序"
+    );
+    assert_eq!(
+        stream.rows.iter().map(|r| r.ids[3]).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3],
+        "每行保留 source packet index"
+    );
+    assert_eq!(
+        stream.spans,
+        vec![
+            pce::SubmissionInstanceSpan {
+                mesh: 2,
+                material: 1,
+                anim_state: 0,
+                first: 0,
+                count: 2,
+            },
+            pce::SubmissionInstanceSpan {
+                mesh: 1,
+                material: 1,
+                anim_state: 3,
+                first: 2,
+                count: 1,
+            },
+            pce::SubmissionInstanceSpan {
+                mesh: 2,
+                material: 1,
+                anim_state: 0,
+                first: 3,
+                count: 1,
+            },
+        ]
+    );
+    let first = &stream.spans[0];
+    assert_eq!(&stream.rows[first.range()], &stream.rows[0..2]);
+    assert_eq!(
+        first.byte_range(),
+        0..2 * pce::SubmissionInstanceRow::BYTE_LEN
+    );
+    for row in &stream.rows {
+        let i = row.packet_index().unwrap();
+        assert_eq!(
+            view.packets[i].inst, ids[i],
+            "source packet index 回查 inst"
+        );
+    }
+
+    let mut reused = pce::SubmissionInstanceStream {
+        rows: vec![pce::SubmissionInstanceRow::default(); 8],
+        spans: vec![pce::SubmissionInstanceSpan {
+            mesh: 99,
+            material: 99,
+            anim_state: 99,
+            first: 99,
+            count: 99,
+        }],
+    };
+    view.fill_instance_stream(&mut reused);
+    assert_eq!(reused, stream, "fill_instance_stream 复用并重建 rows+spans");
+
+    let bytes = stream.instance_bytes();
+    assert_eq!(bytes.len(), stream.byte_len());
+    assert_eq!(
+        stream.byte_len(),
+        stream.rows.len() * pce::SubmissionInstanceRow::BYTE_LEN
+    );
+    let mut first_span_bytes = Vec::new();
+    stream.rows[0].append_le_bytes(&mut first_span_bytes);
+    stream.rows[1].append_le_bytes(&mut first_span_bytes);
+    assert_eq!(&bytes[first.byte_range()], first_span_bytes.as_slice());
+
+    let mut reused_bytes = vec![7u8; 3];
+    stream.fill_instance_bytes(&mut reused_bytes);
+    assert_eq!(
+        reused_bytes, bytes,
+        "fill_instance_bytes 复用并重建 byte stream"
+    );
+}
+
+#[test]
+fn render_runtime_submission_stream_reports_multi_instance_spans_and_bytes() {
+    let (mut rt, unit, f_pos) = sim_with_transform();
+    let f_mesh = rt.field(unit, "mesh");
+    let f_mat = rt.field(unit, "mat");
+
+    let mut rr = RenderRuntime::new(&rt);
+    let r_pos = rr.track(unit, f_pos, Interp::Vec3Lerp).unwrap();
+    let r_mesh = rr.track(unit, f_mesh, Interp::Snap).unwrap();
+    let r_mat = rr.track(unit, f_mat, Interp::Snap).unwrap();
+    rr.renderable(
+        unit,
+        RenderBinding {
+            translation: Some(r_pos),
+            mesh: Some(r_mesh),
+            material: Some(r_mat),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let publisher = Publisher::new(rr.tracked_fields());
+
+    let ids = [
+        rt.spawn(
+            unit,
+            vec![(f_mesh, Value::Int(101)), (f_mat, Value::Int(7))],
+        ),
+        rt.spawn(
+            unit,
+            vec![(f_mesh, Value::Int(101)), (f_mat, Value::Int(7))],
+        ),
+        rt.spawn(
+            unit,
+            vec![(f_mesh, Value::Int(202)), (f_mat, Value::Int(9))],
+        ),
+        rt.spawn(
+            unit,
+            vec![(f_mesh, Value::Int(101)), (f_mat, Value::Int(7))],
+        ),
+    ];
+
+    rt.step();
+    publisher.publish(&rt);
+    rr.sync(&publisher, 0.016, 1.0);
+
+    let view = rr.submit();
+    assert_eq!(view.len(), 4);
+
+    let stream = view.instance_stream();
+    assert_eq!(stream.rows.len(), 4);
+    assert_eq!(stream.byte_len(), 4 * pce::SubmissionInstanceRow::BYTE_LEN);
+    assert_eq!(
+        stream.rows.iter().map(|r| r.span_key()).collect::<Vec<_>>(),
+        vec![(101, 7, 0), (101, 7, 0), (202, 9, 0), (101, 7, 0)],
+        "真实 render runtime 的 stream 也不重排提交顺序"
+    );
+    assert_eq!(
+        stream.spans,
+        vec![
+            pce::SubmissionInstanceSpan {
+                mesh: 101,
+                material: 7,
+                anim_state: 0,
+                first: 0,
+                count: 2,
+            },
+            pce::SubmissionInstanceSpan {
+                mesh: 202,
+                material: 9,
+                anim_state: 0,
+                first: 2,
+                count: 1,
+            },
+            pce::SubmissionInstanceSpan {
+                mesh: 101,
+                material: 7,
+                anim_state: 0,
+                first: 3,
+                count: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        stream.spans[0].byte_range(),
+        0..2 * pce::SubmissionInstanceRow::BYTE_LEN
+    );
+    assert_eq!(
+        stream.spans[1].byte_range(),
+        2 * pce::SubmissionInstanceRow::BYTE_LEN..3 * pce::SubmissionInstanceRow::BYTE_LEN
+    );
+    assert_eq!(
+        stream.spans[2].byte_range(),
+        3 * pce::SubmissionInstanceRow::BYTE_LEN..4 * pce::SubmissionInstanceRow::BYTE_LEN
+    );
+    for row in &stream.rows {
+        let i = row.packet_index().unwrap();
+        assert_eq!(view.packets[i].inst, ids[i], "packet index 回查真实 inst");
+    }
+}
+
+#[test]
+fn empty_submission_instance_stream_has_no_rows_or_spans() {
+    let view = pce::SubmissionView::default();
+    let stream = view.instance_stream();
+    assert!(stream.is_empty());
+    assert!(stream.spans.is_empty());
+}
+
+#[test]
+fn submission_instance_row_sanitizes_values_without_changing_packet_semantics() {
+    let mut rt = Runtime::new();
+    let unit = rt.register_entity_type("Unit", vec![FieldDef::new("x", Value::Int(0))], false);
+    let u = rt.spawn(unit, vec![]);
+
+    let pkt = pce::RenderPacket {
+        inst: u,
+        translation: Value::vec3(f64::NAN, 0.0, 0.0),
+        rotation: Value::quat(0.0, 0.0, 0.0, 2.0),
+        scale: Value::Null,
+        mesh: Value::Int(-7),
+        material: Value::str("mat"),
+        anim_state: Value::Int(4),
+        anim_phase: f64::NAN,
+        fade: f64::NAN,
+    };
+
+    let row = pce::SubmissionInstanceRow::from_packet(&pkt, 9);
+    assert_eq!(
+        row.translation_fade,
+        [0.0, 0.0, 0.0, 1.0],
+        "非法 Vec3 只在 typed seam 回退，NaN fade 用默认实心值"
+    );
+    assert_eq!(row.rotation, [0.0, 0.0, 0.0, 1.0], "非单位四元数归一化");
+    assert_eq!(
+        row.scale_phase,
+        [1.0, 1.0, 1.0, 0.0],
+        "缺 scale → 单位缩放，NaN phase → 0"
+    );
+    assert_eq!(row.ids, [0, 0, 4, 9]);
+    assert_eq!(
+        pkt.material,
+        Value::str("mat"),
+        "语义 packet 不被 typed seam 改写"
+    );
 }
 
 #[test]
